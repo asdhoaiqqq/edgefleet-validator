@@ -2,8 +2,11 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"time"
 
 	"github.com/asdhoaiqqq/edgefleet-validator/edgefleet"
 )
@@ -18,6 +21,8 @@ func main() {
 		runDemo()
 	case "version":
 		fmt.Println("edgefleet 0.1.0")
+	case "heartbeat":
+		runHeartbeat(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -28,7 +33,224 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: edgefleet [demo|version|help]")
+	fmt.Println("usage: edgefleet [demo|version|heartbeat|help]")
+	fmt.Println()
+	fmt.Println("commands:")
+	fmt.Println("  demo       run the built-in evaluation demo")
+	fmt.Println("  version    print version")
+	fmt.Println("  heartbeat  receive, store and query real heartbeats")
+	fmt.Println("  help       show this help")
+	fmt.Println()
+	fmt.Println("run 'edgefleet heartbeat --help' for heartbeat input format and storage location")
+}
+
+// defaultDataDir resolves the data directory: --data-dir flag, then the
+// EDGEFLEET_DATA_DIR environment variable, then ~/.edgefleet.
+func defaultDataDir() string {
+	if d := os.Getenv("EDGEFLEET_DATA_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".edgefleet"
+	}
+	return home + "/.edgefleet"
+}
+
+// die prints an error to stderr and exits with status 1.
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+// parseTime parses an RFC3339 time flag, defaulting to now when empty.
+func parseTimeFlag(value, flagName string) time.Time {
+	if value == "" {
+		return time.Now()
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		die("invalid %s %q: must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00+08:00)", flagName, value)
+	}
+	return t
+}
+
+func runHeartbeat(args []string) {
+	if len(args) == 0 {
+		heartbeatUsage()
+		return
+	}
+	switch args[0] {
+	case "submit":
+		cmdSubmit(args[1:])
+	case "health":
+		cmdHealth(args[1:])
+	case "history":
+		cmdHistory(args[1:])
+	case "help", "-h", "--help":
+		heartbeatUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown heartbeat command %q\n", args[0])
+		heartbeatUsage()
+		os.Exit(2)
+	}
+}
+
+func heartbeatUsage() {
+	fmt.Println("usage: edgefleet heartbeat <submit|health|history> [flags]")
+	fmt.Println()
+	fmt.Println("commands:")
+	fmt.Println("  submit   receive heartbeats from stdin as a JSON array")
+	fmt.Println("  health   query node health from its latest telemetry")
+	fmt.Println("  history  list all heartbeats for a node, ascending by seq")
+	fmt.Println()
+	fmt.Println("input format (submit):")
+	fmt.Println("  A JSON array of heartbeat objects; every field is required.")
+	fmt.Println("    node          string   node id (non-empty)")
+	fmt.Println("    seq           integer  sequence number (> 0)")
+	fmt.Println("    collected_at  string   RFC3339 with timezone, e.g. 2026-10-01T12:00:00+08:00")
+	fmt.Println("                           must not be later than the receive time")
+	fmt.Println("    version       string   version (non-empty)")
+	fmt.Println("    height        integer  block height (>= 0)")
+	fmt.Println("    missed        integer  cumulative missed duties (>= 0)")
+	fmt.Println()
+	fmt.Println("  example:")
+	fmt.Println(`    [{"node":"val-eu-1","seq":7,"collected_at":"2026-10-01T11:59:00+08:00",`)
+	fmt.Println(`      "version":"1.26.0","height":12345,"missed":0}]`)
+	fmt.Println()
+	fmt.Println("flags:")
+	fmt.Println("  submit   --data-dir DIR        data directory (default: $EDGEFLEET_DATA_DIR or ~/.edgefleet)")
+	fmt.Println("           --receive-time TIME   receive time, RFC3339 (default: now)")
+	fmt.Println("  health   --node ID             node id (required)")
+	fmt.Println("           --expected-version V  expected version (required)")
+	fmt.Println("           --tolerated-misses N  tolerated missed duties, >= 0 (required)")
+	fmt.Println("           --at TIME             query time, RFC3339 (default: now)")
+	fmt.Println("           --data-dir DIR        data directory")
+	fmt.Println("  history  --node ID             node id (required)")
+	fmt.Println("           --data-dir DIR        data directory")
+	fmt.Println()
+	fmt.Println("data storage:")
+	fmt.Println("  <data-dir>/nodes/<hex-node-id>.json, one file per node.")
+	fmt.Println("  Writes are atomic and the directory is locked for concurrent access.")
+	fmt.Println("  Corrupt data is refused, never silently cleared.")
+}
+
+func newFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { heartbeatUsage() }
+	return fs
+}
+
+func cmdSubmit(args []string) {
+	fs := newFlagSet("heartbeat submit")
+	dataDir := fs.String("data-dir", defaultDataDir(), "data directory")
+	receiveStr := fs.String("receive-time", "", "receive time (RFC3339); default: now")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	if fs.NArg() != 0 {
+		die("submit takes no positional arguments; heartbeats are read from stdin")
+	}
+
+	receiveTime := parseTimeFlag(*receiveStr, "--receive-time")
+
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		die("cannot read stdin: %v", err)
+	}
+	records, err := edgefleet.ParseHeartbeats(data, receiveTime)
+	if err != nil {
+		die("invalid input: %v", err)
+	}
+
+	store, err := edgefleet.OpenStore(*dataDir)
+	if err != nil {
+		die("%v", err)
+	}
+	newCount, dupCount, err := store.Submit(records, receiveTime)
+	if err != nil {
+		die("%v", err)
+	}
+	fmt.Printf("submitted: new=%d duplicate=%d\n", newCount, dupCount)
+}
+
+func cmdHealth(args []string) {
+	fs := newFlagSet("heartbeat health")
+	dataDir := fs.String("data-dir", defaultDataDir(), "data directory")
+	node := fs.String("node", "", "node id (required)")
+	atStr := fs.String("at", "", "query time (RFC3339); default: now")
+	expectedVersion := fs.String("expected-version", "", "expected version (required)")
+	toleratedMisses := fs.Int("tolerated-misses", -1, "tolerated missed duties, >= 0 (required)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	if *node == "" {
+		die("--node is required")
+	}
+	if *expectedVersion == "" {
+		die("--expected-version is required")
+	}
+	if *toleratedMisses < 0 {
+		die("--tolerated-misses is required and must be >= 0")
+	}
+
+	at := parseTimeFlag(*atStr, "--at")
+
+	store, err := edgefleet.OpenStore(*dataDir)
+	if err != nil {
+		die("%v", err)
+	}
+	result, err := store.Health(*node, at, *expectedVersion, *toleratedMisses)
+	if err != nil {
+		die("%v", err)
+	}
+
+	if result.Status == "notelemetry" {
+		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", result.NodeID)
+		return
+	}
+	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
+		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
+		result.Version, result.Height, result.Missed, result.Findings)
+}
+
+func cmdHistory(args []string) {
+	fs := newFlagSet("heartbeat history")
+	dataDir := fs.String("data-dir", defaultDataDir(), "data directory")
+	node := fs.String("node", "", "node id (required)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	if *node == "" {
+		die("--node is required")
+	}
+
+	store, err := edgefleet.OpenStore(*dataDir)
+	if err != nil {
+		die("%v", err)
+	}
+	records, err := store.History(*node)
+	if err != nil {
+		die("%v", err)
+	}
+	if len(records) == 0 {
+		fmt.Printf("node=%s no heartbeats\n", *node)
+		return
+	}
+	for _, r := range records {
+		fmt.Printf("node=%s seq=%d collected_at=%s version=%s height=%d missed=%d\n",
+			r.NodeID, r.Seq, r.CollectedAt.Format(time.RFC3339), r.Version, r.Height, r.Missed)
+	}
 }
 
 func runDemo() {
