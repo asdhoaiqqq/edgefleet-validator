@@ -2,7 +2,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -32,7 +31,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds>|help]")
+	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds> [--partitions <count>]|help]")
 	fmt.Println()
 	fmt.Println("commands:")
 	fmt.Println("  demo       run a built-in fleet health demonstration")
@@ -41,7 +40,7 @@ func usage() {
 	fmt.Println("  help       show this help")
 	fmt.Println()
 	fmt.Println("aggregate:")
-	fmt.Println("  edgefleet aggregate --window-ms <milliseconds>")
+	fmt.Println("  edgefleet aggregate --window-ms <milliseconds> [--partitions <count>]")
 	fmt.Println()
 	fmt.Println("  --window-ms is a required positive signed 64-bit integer. Aggregation runs")
 	fmt.Println("  fully offline and never uses the current time; all timing comes from input.")
@@ -68,22 +67,40 @@ func usage() {
 	fmt.Println("  exactly the current watermark is still valid; events below the current")
 	fmt.Println("  watermark are skipped with a note on standard error.")
 	fmt.Println()
+	fmt.Println("  --partitions merges several independent input sources of the same stream.")
+	fmt.Println("  <count> must be a positive signed 64-bit integer. When it is given, every")
+	fmt.Println("  event and watermark record must additionally carry an integer partition in")
+	fmt.Println("  [0,count):")
+	fmt.Println(`    {"type":"event","key":"sensor-a","time":1200,"value":5,"partition":0}`)
+	fmt.Println(`    {"type":"watermark","time":2000,"partition":0}`)
+	fmt.Println("  each partition advances its own watermark independently. No effective")
+	fmt.Println("  watermark exists until every partition has reported at least once;")
+	fmt.Println("  afterwards the effective watermark is the minimum of the per-partition")
+	fmt.Println("  values, and window closure and late-event checks use that minimum, so one")
+	fmt.Println("  partition's larger watermark can never close a window or drop an event")
+	fmt.Println("  ahead of the others. A partition watermark may repeat or jump forward but")
+	fmt.Println("  never move backwards. Events from different partitions for the same key")
+	fmt.Println("  and window merge into one count and sum; output records never include a")
+	fmt.Println("  partition field. Without --partitions the command keeps the single")
+	fmt.Println("  watermark behavior and ignores extra fields.")
+	fmt.Println()
 	fmt.Println("  at end of input the watermark is not advanced and still-open windows are")
 	fmt.Println("  not emitted. Malformed JSON, missing or mistyped fields, out-of-range")
-	fmt.Println("  integers, unknown record types, watermark regression, and window-end or")
-	fmt.Println("  cumulative-sum overflow print the line number and reason to standard")
-	fmt.Println("  error and exit non-zero; earlier output is retained. Standard output")
-	fmt.Println("  contains window results only.")
+	fmt.Println("  integers, unknown record types, missing or out-of-range partitions,")
+	fmt.Println("  partition watermark regression, and window-end or cumulative-sum overflow")
+	fmt.Println("  print the line number and reason to standard error and exit non-zero;")
+	fmt.Println("  earlier output is retained. Standard output contains window results only.")
 }
 
 func runAggregate(args []string) int {
 	fs := flag.NewFlagSet("aggregate", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds>")
+		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds> [--partitions <count>]")
 		fmt.Fprintln(fs.Output(), `run "edgefleet help" for the full record and window closure rules`)
 	}
 	windowMillis := fs.Int64("window-ms", 0, "fixed window length in milliseconds (required, positive signed 64-bit integer)")
+	partitions := fs.Int64("partitions", 0, "number of input partitions (optional positive signed 64-bit integer); when set, every record must carry an integer partition in [0,count)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,13 +109,17 @@ func runAggregate(args []string) int {
 		fs.Usage()
 		return 2
 	}
-	specified := false
+	windowSpecified := false
+	partitionsSpecified := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "window-ms" {
-			specified = true
+		switch f.Name {
+		case "window-ms":
+			windowSpecified = true
+		case "partitions":
+			partitionsSpecified = true
 		}
 	})
-	if !specified {
+	if !windowSpecified {
 		fmt.Fprintln(os.Stderr, "aggregate requires --window-ms <milliseconds>")
 		fs.Usage()
 		return 2
@@ -107,12 +128,17 @@ func runAggregate(args []string) int {
 		fmt.Fprintf(os.Stderr, "aggregate --window-ms must be a positive signed 64-bit integer, got %d\n", *windowMillis)
 		return 2
 	}
-	if err := edgefleet.RunAggregate(os.Stdin, *windowMillis, os.Stdout, os.Stderr); err != nil {
-		var inputErr *edgefleet.InputError
-		if errors.As(err, &inputErr) {
-			fmt.Fprintln(os.Stderr, "aggregate:", err)
-			return 1
-		}
+	if partitionsSpecified && *partitions <= 0 {
+		fmt.Fprintf(os.Stderr, "aggregate --partitions must be a positive signed 64-bit integer, got %d\n", *partitions)
+		return 2
+	}
+	var err error
+	if partitionsSpecified {
+		err = edgefleet.RunAggregatePartitioned(os.Stdin, *windowMillis, *partitions, os.Stdout, os.Stderr)
+	} else {
+		err = edgefleet.RunAggregate(os.Stdin, *windowMillis, os.Stdout, os.Stderr)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "aggregate:", err)
 		return 1
 	}

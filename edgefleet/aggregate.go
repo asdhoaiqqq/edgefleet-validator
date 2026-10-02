@@ -52,13 +52,48 @@ type windowState struct {
 // reported on lateLog with their physical line number and skipped. Fatal
 // record problems return *InputError; results already written to out stay
 // written, and open windows are not flushed at end of input.
+//
+// This is the legacy single-watermark mode: records carry no partition field
+// and any extra fields are ignored. Use RunAggregatePartitioned to merge
+// several independent input sources of the same stream.
 func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Writer) error {
+	return RunAggregatePartitioned(r, windowMillis, 0, out, lateLog)
+}
+
+// RunAggregatePartitioned reads line-delimited JSON records from r and writes
+// closed window results, one JSON object per line, to out. windowMillis must
+// be a positive signed 64-bit integer. partitions selects the input mode:
+//
+//   - partitions == 0: legacy single-watermark mode. Records do not carry a
+//     partition field; any extra fields are ignored.
+//   - partitions > 0: partitioned mode, merging partitions independent input
+//     sources of the same stream. Every event and watermark record must carry
+//     an integer "partition" in [0,partitions). Each partition advances its
+//     own watermark; no effective watermark exists until every partition has
+//     reported at least once, afterwards the effective watermark is the
+//     minimum of the per-partition values. Window closure and late-event
+//     checks use this minimum, so one partition's larger watermark can never
+//     close a window or drop an event ahead of the others. A partition
+//     watermark may repeat or jump forward but never move backwards.
+//
+// partitions < 0 is an error. Windows, ordering, late-event reporting,
+// overflow checks and end-of-input behavior are otherwise identical to
+// RunAggregate.
+func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
 	if windowMillis <= 0 {
 		return fmt.Errorf("window length must be a positive signed 64-bit integer, got %d", windowMillis)
 	}
-
-	windows := make(map[windowID]*windowState)
-	var watermark *int64
+	if partitions < 0 {
+		return fmt.Errorf("partition count must be a positive signed 64-bit integer, got %d", partitions)
+	}
+	s := &aggregateState{
+		windowMillis:  windowMillis,
+		windows:       make(map[windowID]*windowState),
+		out:           out,
+		lateLog:       lateLog,
+		partitions:    partitions,
+		partWatermark: make(map[int64]*int64),
+	}
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024*1024)
@@ -69,14 +104,25 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		if err := processAggregateLine(line, lineNo, windowMillis, windows, &watermark, out, lateLog); err != nil {
+		if err := s.processLine(line, lineNo); err != nil {
 			return err
 		}
 	}
 	return scanner.Err()
 }
 
-func processAggregateLine(line string, lineNo int, windowMillis int64, windows map[windowID]*windowState, watermark **int64, out io.Writer, lateLog io.Writer) error {
+type aggregateState struct {
+	windowMillis int64
+	windows      map[windowID]*windowState
+	out          io.Writer
+	lateLog      io.Writer
+
+	partitions    int64 // 0 = legacy single-watermark mode
+	watermark     *int64
+	partWatermark map[int64]*int64 // partition -> last watermark; partitioned mode only
+}
+
+func (s *aggregateState) processLine(line string, lineNo int) error {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		return &InputError{Line: lineNo, Reason: "invalid JSON record: " + err.Error()}
@@ -93,15 +139,15 @@ func processAggregateLine(line string, lineNo int, windowMillis int64, windows m
 
 	switch recordType {
 	case "event":
-		return processEvent(obj, lineNo, windowMillis, windows, *watermark, lateLog)
+		return s.processEvent(obj, lineNo)
 	case "watermark":
-		return processWatermark(obj, lineNo, windows, watermark, out)
+		return s.processWatermark(obj, lineNo)
 	default:
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
 	}
 }
 
-func processEvent(obj map[string]json.RawMessage, lineNo int, windowMillis int64, windows map[windowID]*windowState, watermark *int64, lateLog io.Writer) error {
+func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
 	key, err := requiredString(obj, "key", lineNo)
 	if err != nil {
 		return err
@@ -117,23 +163,26 @@ func processEvent(obj map[string]json.RawMessage, lineNo int, windowMillis int64
 	if err != nil {
 		return err
 	}
+	if _, err := s.requiredPartition(obj, lineNo); err != nil {
+		return err
+	}
 
-	if watermark != nil && eventTime < *watermark {
-		fmt.Fprintf(lateLog, "line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *watermark)
+	if s.watermark != nil && eventTime < *s.watermark {
+		fmt.Fprintf(s.lateLog, "line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *s.watermark)
 		return nil
 	}
 
-	start := eventTime - eventTime%windowMillis
-	if start > math.MaxInt64-windowMillis {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, start, windowMillis)}
+	start := eventTime - eventTime%s.windowMillis
+	if start > math.MaxInt64-s.windowMillis {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, start, s.windowMillis)}
 	}
-	end := start + windowMillis
+	end := start + s.windowMillis
 
 	id := windowID{start: start, key: key}
-	st := windows[id]
+	st := s.windows[id]
 	if st == nil {
 		st = &windowState{end: end}
-		windows[id] = st
+		s.windows[id] = st
 	}
 	if st.count == math.MaxInt64 {
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", key, start, end)}
@@ -149,23 +198,76 @@ func processEvent(obj map[string]json.RawMessage, lineNo int, windowMillis int64
 	return nil
 }
 
-func processWatermark(obj map[string]json.RawMessage, lineNo int, windows map[windowID]*windowState, watermark **int64, out io.Writer) error {
+func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo int) error {
 	next, err := requiredNonNegInt64(obj, "time", lineNo)
 	if err != nil {
 		return err
 	}
-	if *watermark != nil && next < **watermark {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", **watermark, next)}
+	p, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
+		return err
 	}
-	*watermark = &next
 
+	if s.partitions == 0 {
+		if s.watermark != nil && next < *s.watermark {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, next)}
+		}
+		s.watermark = &next
+	} else {
+		if prev, ok := s.partWatermark[p]; ok && next < *prev {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
+		}
+		s.partWatermark[p] = &next
+		s.watermark = s.effectiveWatermark()
+	}
+
+	if s.watermark == nil {
+		return nil
+	}
+	return s.closeWindows(*s.watermark)
+}
+
+// effectiveWatermark returns the minimum of the per-partition watermarks once
+// every partition has reported at least one, or nil otherwise.
+func (s *aggregateState) effectiveWatermark() *int64 {
+	if len(s.partWatermark) != int(s.partitions) {
+		return nil
+	}
+	var min int64
+	first := true
+	for _, w := range s.partWatermark {
+		if first || *w < min {
+			min = *w
+			first = false
+		}
+	}
+	return &min
+}
+
+// requiredPartition returns the record's partition index. In legacy mode it
+// returns 0 without inspecting the record, so extra fields stay ignored.
+func (s *aggregateState) requiredPartition(obj map[string]json.RawMessage, lineNo int) (int64, error) {
+	if s.partitions == 0 {
+		return 0, nil
+	}
+	p, err := requiredInt64(obj, "partition", lineNo)
+	if err != nil {
+		return 0, err
+	}
+	if p < 0 || p >= s.partitions {
+		return 0, &InputError{Line: lineNo, Reason: fmt.Sprintf("field %q must be an integer in range [0,%d), got %d", "partition", s.partitions, p)}
+	}
+	return p, nil
+}
+
+func (s *aggregateState) closeWindows(watermark int64) error {
 	type pending struct {
 		id windowID
 		st *windowState
 	}
 	var ready []pending
-	for id, st := range windows {
-		if st.end <= next {
+	for id, st := range s.windows {
+		if st.end <= watermark {
 			ready = append(ready, pending{id: id, st: st})
 		}
 	}
@@ -186,10 +288,10 @@ func processWatermark(obj map[string]json.RawMessage, lineNo int, windows map[wi
 		if err != nil {
 			return err
 		}
-		if _, err := out.Write(append(encoded, '\n')); err != nil {
+		if _, err := s.out.Write(append(encoded, '\n')); err != nil {
 			return err
 		}
-		delete(windows, p.id)
+		delete(s.windows, p.id)
 	}
 	return nil
 }
