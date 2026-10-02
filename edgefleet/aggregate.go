@@ -76,6 +76,16 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 //     close a window or drop an event ahead of the others. A partition
 //     watermark may repeat or jump forward but never move backwards.
 //
+//     A partition with no data for a while can be declared idle with
+//     {"type":"idle","partition":N}. While idle the partition is excluded
+//     from the effective watermark, so the remaining partitions can advance
+//     it and close windows; the idle record itself can trigger closure. An
+//     event for an idle partition is fatal. The next watermark for the
+//     partition resumes it and must be at least both the partition's previous
+//     watermark and the current effective watermark; equality is allowed.
+//     Repeated idle records are no-ops. Idle is declared entirely by the
+//     input and never inferred from elapsed time or read intervals.
+//
 // partitions < 0 is an error. Windows, ordering, late-event reporting,
 // overflow checks and end-of-input behavior are otherwise identical to
 // RunAggregate.
@@ -93,6 +103,7 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 		lateLog:       lateLog,
 		partitions:    partitions,
 		partWatermark: make(map[int64]*int64),
+		idle:          make(map[int64]bool),
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -120,6 +131,7 @@ type aggregateState struct {
 	partitions    int64 // 0 = legacy single-watermark mode
 	watermark     *int64
 	partWatermark map[int64]*int64 // partition -> last watermark; partitioned mode only
+	idle          map[int64]bool   // partitions currently declared idle; partitioned mode only
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
@@ -142,6 +154,8 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 		return s.processEvent(obj, lineNo)
 	case "watermark":
 		return s.processWatermark(obj, lineNo)
+	case "idle":
+		return s.processIdle(obj, lineNo)
 	default:
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
 	}
@@ -163,8 +177,12 @@ func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int
 	if err != nil {
 		return err
 	}
-	if _, err := s.requiredPartition(obj, lineNo); err != nil {
+	p, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
 		return err
+	}
+	if s.idle[p] {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("partition %d is idle; event records are not allowed while the partition is declared idle", p)}
 	}
 
 	if s.watermark != nil && eventTime < *s.watermark {
@@ -213,6 +231,19 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, next)}
 		}
 		s.watermark = &next
+	} else if s.idle[p] {
+		// Resuming an idle partition. The record must satisfy both the
+		// partition's own watermark bound and the current effective
+		// watermark, so the min cannot move backwards when it rejoins.
+		if prev, ok := s.partWatermark[p]; ok && next < *prev {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d resumes at %d below its previous watermark %d", p, next, *prev)}
+		}
+		if s.watermark != nil && next < *s.watermark {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d resumes at %d below the current effective watermark %d", p, next, *s.watermark)}
+		}
+		s.partWatermark[p] = &next
+		s.idle[p] = false
+		s.watermark = s.effectiveWatermark()
 	} else {
 		if prev, ok := s.partWatermark[p]; ok && next < *prev {
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
@@ -227,19 +258,53 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 	return s.closeWindows(*s.watermark)
 }
 
-// effectiveWatermark returns the minimum of the per-partition watermarks once
-// every partition has reported at least one, or nil otherwise.
-func (s *aggregateState) effectiveWatermark() *int64 {
-	if len(s.partWatermark) != int(s.partitions) {
+// processIdle declares a partition idle. While idle the partition is excluded
+// from the effective watermark, so the remaining partitions can advance it;
+// the idle record itself can trigger window closure. Repeated idle records
+// are no-ops. Idle is only meaningful in partitioned mode, where it is a
+// declared input fact rather than an inferred timeout.
+func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int) error {
+	if s.partitions == 0 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", "idle")}
+	}
+	p, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
+		return err
+	}
+	if s.idle[p] {
 		return nil
 	}
+	s.idle[p] = true
+	s.watermark = s.effectiveWatermark()
+	if s.watermark == nil {
+		return nil
+	}
+	return s.closeWindows(*s.watermark)
+}
+
+// effectiveWatermark returns the minimum of the per-partition watermarks once
+// every non-idle partition has reported at least one, or nil otherwise. Idle
+// partitions are excluded from the minimum; when every partition is idle the
+// previously produced watermark is kept (nil if none was ever produced), so
+// idle is never treated as an infinite watermark.
+func (s *aggregateState) effectiveWatermark() *int64 {
 	var min int64
 	first := true
-	for _, w := range s.partWatermark {
+	for p := int64(0); p < s.partitions; p++ {
+		if s.idle[p] {
+			continue
+		}
+		w, ok := s.partWatermark[p]
+		if !ok {
+			return nil
+		}
 		if first || *w < min {
 			min = *w
 			first = false
 		}
+	}
+	if first {
+		return s.watermark
 	}
 	return &min
 }
