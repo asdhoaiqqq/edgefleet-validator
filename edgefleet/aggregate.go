@@ -96,14 +96,39 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 // overflow checks and end-of-input behavior are otherwise identical to
 // RunAggregate.
 func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateSliding(r, windowMillis, windowMillis, partitions, out, lateLog)
+}
+
+// RunAggregateSliding is RunAggregatePartitioned with overlapping windows:
+// slideMillis is the interval between consecutive window starts. Windows
+// still start at time zero, so the starts are 0, slideMillis, 2*slideMillis,
+// ... and every window has length windowMillis and is left-closed right-open.
+// A valid event contributes to every window that contains its event time;
+// late events are skipped whole even when they would still fall inside an
+// open overlapping window. slideMillis must be a positive signed 64-bit
+// integer no greater than windowMillis; it need not divide windowMillis. When
+// slideMillis equals windowMillis the windows are fixed and the behavior is
+// identical to RunAggregatePartitioned.
+func RunAggregateSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateSliding(r, windowMillis, slideMillis, partitions, out, lateLog)
+}
+
+func runAggregateSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
 	if windowMillis <= 0 {
 		return fmt.Errorf("window length must be a positive signed 64-bit integer, got %d", windowMillis)
+	}
+	if slideMillis <= 0 {
+		return fmt.Errorf("slide interval must be a positive signed 64-bit integer, got %d", slideMillis)
+	}
+	if slideMillis > windowMillis {
+		return fmt.Errorf("slide interval %d must not exceed window length %d", slideMillis, windowMillis)
 	}
 	if partitions < 0 {
 		return fmt.Errorf("partition count must be a positive signed 64-bit integer, got %d", partitions)
 	}
 	s := &aggregateState{
 		windowMillis:  windowMillis,
+		slideMillis:   slideMillis,
 		windows:       make(map[windowID]*windowState),
 		out:           out,
 		lateLog:       lateLog,
@@ -130,6 +155,7 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 
 type aggregateState struct {
 	windowMillis int64
+	slideMillis  int64 // interval between consecutive window starts; equals windowMillis for fixed windows
 	windows      map[windowID]*windowState
 	out          io.Writer
 	lateLog      io.Writer
@@ -201,7 +227,39 @@ func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int
 		return nil
 	}
 
-	start := eventTime - eventTime%s.windowMillis
+	// A valid event belongs to every window that contains its event time t:
+	// starts s = k*slide with s <= t < s+window and s >= 0, i.e.
+	// (t-window)/slide < k <= t/slide.
+	kMax := eventTime / s.slideMillis
+	kMin := floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
+	if kMin < 0 {
+		kMin = 0 // windows never start before time zero
+	}
+	for k := kMin; ; k++ {
+		start := k * s.slideMillis
+		if err := s.addToWindow(key, start, value, lineNo); err != nil {
+			return err
+		}
+		if k == kMax { // kMax may be MaxInt64, so a plain k++ loop would wrap
+			break
+		}
+	}
+	return nil
+}
+
+// floorDiv returns floor(a/b) for b > 0; Go's / truncates toward zero.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
+}
+
+// addToWindow attributes one event to the window [start,start+window) for
+// key, creating the window if needed. Any end, count or cumulative-sum
+// overflow is reported against lineNo and the offending window.
+func (s *aggregateState) addToWindow(key string, start, value int64, lineNo int) error {
 	if start > math.MaxInt64-s.windowMillis {
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, start, s.windowMillis)}
 	}

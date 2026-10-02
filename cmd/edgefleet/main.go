@@ -31,19 +31,31 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds> [--partitions <count>]|help]")
+	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds> [--slide-ms <interval>] [--partitions <count>]|help]")
 	fmt.Println()
 	fmt.Println("commands:")
 	fmt.Println("  demo       run a built-in fleet health demonstration")
 	fmt.Println("  version    print the edgefleet version")
-	fmt.Println("  aggregate  aggregate JSON events from standard input into fixed windows")
+	fmt.Println("  aggregate  aggregate JSON events from standard input into fixed or sliding windows")
 	fmt.Println("  help       show this help")
 	fmt.Println()
 	fmt.Println("aggregate:")
-	fmt.Println("  edgefleet aggregate --window-ms <milliseconds> [--partitions <count>]")
+	fmt.Println("  edgefleet aggregate --window-ms <milliseconds> [--slide-ms <interval>] [--partitions <count>]")
 	fmt.Println()
 	fmt.Println("  --window-ms is a required positive signed 64-bit integer. Aggregation runs")
 	fmt.Println("  fully offline and never uses the current time; all timing comes from input.")
+	fmt.Println()
+	fmt.Println("  --slide-ms is an optional positive signed 64-bit integer no greater than")
+	fmt.Println("  --window-ms; it need not divide the window length. When it is given,")
+	fmt.Println("  windows overlap: they still start at time zero with left-closed,")
+	fmt.Println("  right-open intervals, but consecutive starts are one --slide-ms interval")
+	fmt.Println("  apart, so the starts are 0, slide, 2*slide, ... An event contributes to")
+	fmt.Println("  every window that contains its event time: with --window-ms 1000 and")
+	fmt.Println("  --slide-ms 600, the same key at times 700 and 1000 with values 2 and 3")
+	fmt.Println("  yields count 1 sum 2 in [0,1000) and count 2 sum 5 in [600,1600); the")
+	fmt.Println("  event at 1000 is not in [0,1000). Omitting --slide-ms, or passing an")
+	fmt.Println("  interval equal to --window-ms, gives the fixed windows described below.")
+	fmt.Println("  Windows never start before time zero.")
 	fmt.Println()
 	fmt.Println("  standard input is line-delimited JSON with two record types:")
 	fmt.Println(`    {"type":"event","key":"sensor-a","time":1200,"value":5}`)
@@ -115,10 +127,11 @@ func runAggregate(args []string) int {
 	fs := flag.NewFlagSet("aggregate", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds> [--partitions <count>]")
+		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds> [--slide-ms <interval>] [--partitions <count>]")
 		fmt.Fprintln(fs.Output(), `run "edgefleet help" for the full record and window closure rules`)
 	}
 	windowMillis := fs.Int64("window-ms", 0, "fixed window length in milliseconds (required, positive signed 64-bit integer)")
+	slideMillis := fs.Int64("slide-ms", 0, "interval between overlapping window starts in milliseconds (optional positive signed 64-bit integer, must not exceed --window-ms); defaults to --window-ms, which yields fixed windows")
 	partitions := fs.Int64("partitions", 0, "number of input partitions (optional positive signed 64-bit integer); when set, every record must carry an integer partition in [0,count)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -129,11 +142,14 @@ func runAggregate(args []string) int {
 		return 2
 	}
 	windowSpecified := false
+	slideSpecified := false
 	partitionsSpecified := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "window-ms":
 			windowSpecified = true
+		case "slide-ms":
+			slideSpecified = true
 		case "partitions":
 			partitionsSpecified = true
 		}
@@ -147,14 +163,25 @@ func runAggregate(args []string) int {
 		fmt.Fprintf(os.Stderr, "aggregate --window-ms must be a positive signed 64-bit integer, got %d\n", *windowMillis)
 		return 2
 	}
+	if slideSpecified && *slideMillis <= 0 {
+		fmt.Fprintf(os.Stderr, "aggregate --slide-ms must be a positive signed 64-bit integer, got %d\n", *slideMillis)
+		return 2
+	}
+	if slideSpecified && *slideMillis > *windowMillis {
+		fmt.Fprintf(os.Stderr, "aggregate --slide-ms %d must not exceed --window-ms %d\n", *slideMillis, *windowMillis)
+		return 2
+	}
 	if partitionsSpecified && *partitions <= 0 {
 		fmt.Fprintf(os.Stderr, "aggregate --partitions must be a positive signed 64-bit integer, got %d\n", *partitions)
 		return 2
 	}
 	var err error
-	if partitionsSpecified {
+	switch {
+	case slideSpecified:
+		err = edgefleet.RunAggregateSliding(os.Stdin, *windowMillis, *slideMillis, *partitions, os.Stdout, os.Stderr)
+	case partitionsSpecified:
 		err = edgefleet.RunAggregatePartitioned(os.Stdin, *windowMillis, *partitions, os.Stdout, os.Stderr)
-	} else {
+	default:
 		err = edgefleet.RunAggregate(os.Stdin, *windowMillis, os.Stdout, os.Stderr)
 	}
 	if err != nil {
