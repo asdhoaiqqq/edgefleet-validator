@@ -124,6 +124,15 @@ func heartbeatUsage() {
 	fmt.Println("  health   --node ID             node id (required)")
 	fmt.Println("           --expected-version V  expected version (required)")
 	fmt.Println("           --tolerated-misses N  tolerated missed duties, >= 0 (required)")
+	fmt.Println("           --missed-since-seq N  count new missed duties since this seq; N must be a")
+	fmt.Println("                                already stored positive heartbeat seq, not greater than")
+	fmt.Println("                                the latest seq. When provided, the missed-duty alert is")
+	fmt.Println("                                based on new missed duties in the interval (strictly")
+	fmt.Println("                                greater than N alerts; equal does not). If cumulative")
+	fmt.Println("                                missed counts rolled back between any adjacent saved")
+	fmt.Println("                                records in the interval, new_missed shows 无法判断 and")
+	fmt.Println("                                a 累计漏签数回退 alert is given. The baseline affects")
+	fmt.Println("                                only this query.")
 	fmt.Println("           --at TIME             query time, RFC3339 (default: now)")
 	fmt.Println("           --data-dir DIR        data directory")
 	fmt.Println("  history  --node ID             node id (required)")
@@ -185,6 +194,7 @@ func cmdHealth(args []string) {
 	atStr := fs.String("at", "", "query time (RFC3339); default: now")
 	expectedVersion := fs.String("expected-version", "", "expected version (required)")
 	toleratedMisses := fs.Int("tolerated-misses", -1, "tolerated missed duties, >= 0 (required)")
+	missedSinceSeq := fs.Int64("missed-since-seq", -1, "count new missed duties since this stored seq (> 0); when cumulative missed counts rolled back inside the interval, new_missed is 无法判断")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			os.Exit(0)
@@ -200,6 +210,13 @@ func cmdHealth(args []string) {
 	if *toleratedMisses < 0 {
 		die("--tolerated-misses is required and must be >= 0")
 	}
+	var sinceSeq int64
+	if *missedSinceSeq != -1 {
+		if *missedSinceSeq <= 0 {
+			die("--missed-since-seq must be a positive integer, got %d", *missedSinceSeq)
+		}
+		sinceSeq = *missedSinceSeq
+	}
 
 	at := parseTimeFlag(*atStr, "--at")
 
@@ -207,7 +224,12 @@ func cmdHealth(args []string) {
 	if err != nil {
 		die("%v", err)
 	}
-	result, err := store.Health(*node, at, *expectedVersion, *toleratedMisses)
+	var result edgefleet.HealthResult
+	if sinceSeq > 0 {
+		result, err = store.HealthSince(*node, at, *expectedVersion, *toleratedMisses, sinceSeq)
+	} else {
+		result, err = store.Health(*node, at, *expectedVersion, *toleratedMisses)
+	}
 	if err != nil {
 		die("%v", err)
 	}
@@ -219,6 +241,15 @@ func cmdHealth(args []string) {
 	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
 		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
 		result.Version, result.Height, result.Missed, result.Findings)
+	if result.SinceSeq != 0 {
+		if result.MissedSinceUnknown {
+			fmt.Printf("missed_since_seq=%d missed_since=%d new_missed=无法判断\n",
+				result.SinceSeq, result.SinceMissed)
+		} else {
+			fmt.Printf("missed_since_seq=%d missed_since=%d new_missed=%d\n",
+				result.SinceSeq, result.SinceMissed, result.NewMissed)
+		}
+	}
 }
 
 func cmdHistory(args []string) {

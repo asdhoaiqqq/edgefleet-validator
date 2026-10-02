@@ -1094,7 +1094,7 @@ func TestNodePathReversible(t *testing.T) {
 
 func TestValidateHeartbeatErrorMessage(t *testing.T) {
 	cases := []struct {
-		hb  Heartbeat
+		hb   Heartbeat
 		want string
 	}{
 		{hb("", 1, testBase, "1.0", 1, 0), "node"},
@@ -1138,6 +1138,404 @@ func TestHealthAtExactlyQueryTime(t *testing.T) {
 	}
 	if r.Status != "online" {
 		t.Errorf("at exact collection time status=%s, want online", r.Status)
+	}
+}
+
+// submitSeqMissed submits one heartbeat per (seq, missed) pair for node n1,
+// all collected within the online window of receive.
+func submitSeqMissed(t *testing.T, store *Store, receive time.Time, pairs ...struct {
+	seq    int64
+	missed int64
+}) {
+	t.Helper()
+	batch := make([]Heartbeat, 0, len(pairs))
+	for i, p := range pairs {
+		batch = append(batch, hb("n1", p.seq, receive.Add(-time.Duration(len(pairs)-i)*time.Second), "1.0", 100+p.seq, p.missed))
+	}
+	if _, _, err := store.Submit(batch, receive); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hasFinding(findings []string, sub string) bool {
+	for _, f := range findings {
+		if strings.Contains(f, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestHealthSinceBasic: baseline missed 12, latest missed 14, tolerated 2 ->
+// new missed 2, no alert (equal to tolerance is not over-limit).
+func TestHealthSinceBasic(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{10, 12},
+		struct{ seq, missed int64 }{11, 12},
+		struct{ seq, missed int64 }{12, 13},
+		struct{ seq, missed int64 }{13, 14},
+		struct{ seq, missed int64 }{14, 14},
+	)
+
+	r, err := store.HealthSince("n1", receive, "1.0", 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SinceSeq != 10 || r.SinceMissed != 12 || r.NewMissed != 2 || r.MissedSinceUnknown {
+		t.Errorf("baseline fields wrong: sinceSeq=%d sinceMissed=%d newMissed=%d unknown=%v",
+			r.SinceSeq, r.SinceMissed, r.NewMissed, r.MissedSinceUnknown)
+	}
+	if hasFinding(r.Findings, "missed") {
+		t.Errorf("new missed == tolerance must not alert, findings=%v", r.Findings)
+	}
+	// Latest telemetry is still the max seq.
+	if r.Seq != 14 || r.Missed != 14 {
+		t.Errorf("latest telemetry wrong: seq=%d missed=%d", r.Seq, r.Missed)
+	}
+
+	// Legacy cumulative judgement is unchanged without a baseline.
+	rc, err := store.Health("n1", receive, "1.0", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(rc.Findings, "missed duties above tolerance") {
+		t.Errorf("cumulative mode should still alert on 14 > 2, findings=%v", rc.Findings)
+	}
+	if rc.SinceSeq != 0 {
+		t.Errorf("legacy result should have no baseline, got sinceSeq=%d", rc.SinceSeq)
+	}
+}
+
+// TestHealthSinceOverTolerance: new missed 3 > tolerated 2 -> alert.
+func TestHealthSinceOverTolerance(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{10, 12},
+		struct{ seq, missed int64 }{14, 15},
+	)
+	r, err := store.HealthSince("n1", receive, "1.0", 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.NewMissed != 3 || r.MissedSinceUnknown {
+		t.Errorf("newMissed=%d unknown=%v, want 3/false", r.NewMissed, r.MissedSinceUnknown)
+	}
+	if !hasFinding(r.Findings, "new missed duties above tolerance") {
+		t.Errorf("expected new-missed alert, findings=%v", r.Findings)
+	}
+	// The cumulative alert must not also fire (exact match: the new-missed
+	// finding contains the cumulative phrase as a substring).
+	for _, f := range r.Findings {
+		if f == "missed duties above tolerance" {
+			t.Errorf("cumulative alert must not fire with a baseline, findings=%v", r.Findings)
+		}
+	}
+}
+
+// TestHealthSinceBaselineIsLatest: baseline seq equals latest seq -> 0 new.
+func TestHealthSinceBaselineIsLatest(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{10, 12},
+		struct{ seq, missed int64 }{14, 14},
+	)
+	r, err := store.HealthSince("n1", receive, "1.0", 2, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SinceSeq != 14 || r.SinceMissed != 14 || r.NewMissed != 0 || r.MissedSinceUnknown {
+		t.Errorf("baseline==latest: sinceSeq=%d sinceMissed=%d newMissed=%d unknown=%v",
+			r.SinceSeq, r.SinceMissed, r.NewMissed, r.MissedSinceUnknown)
+	}
+	if hasFinding(r.Findings, "missed") {
+		t.Errorf("baseline==latest must not alert, findings=%v", r.Findings)
+	}
+}
+
+// TestHealthSinceRollback: a cumulative decrease inside the interval makes
+// the new count undeterminable, even though the latest count (14) is above
+// the baseline (12).
+func TestHealthSinceRollback(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{10, 12},
+		struct{ seq, missed int64 }{11, 8}, // rollback
+		struct{ seq, missed int64 }{12, 14},
+	)
+	r, err := store.HealthSince("n1", receive, "1.0", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.MissedSinceUnknown {
+		t.Errorf("expected unknown after rollback, got newMissed=%d", r.NewMissed)
+	}
+	if !hasFinding(r.Findings, "累计漏签数回退") {
+		t.Errorf("expected rollback alert, findings=%v", r.Findings)
+	}
+	if hasFinding(r.Findings, "new missed duties above tolerance") {
+		t.Errorf("must not report a numeric new-missed alert after rollback, findings=%v", r.Findings)
+	}
+}
+
+// TestHealthSinceRollbackBeforeBaseline: a decrease before the baseline is
+// ignored; the interval itself is monotonic.
+func TestHealthSinceRollbackBeforeBaseline(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{1, 5},
+		struct{ seq, missed int64 }{2, 2}, // decrease before baseline
+		struct{ seq, missed int64 }{3, 3}, // baseline
+		struct{ seq, missed int64 }{4, 4},
+	)
+	r, err := store.HealthSince("n1", receive, "1.0", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MissedSinceUnknown || r.NewMissed != 1 {
+		t.Errorf("decrease before baseline should be ignored: unknown=%v newMissed=%d",
+			r.MissedSinceUnknown, r.NewMissed)
+	}
+	if hasFinding(r.Findings, "累计漏签数回退") {
+		t.Errorf("rollback before baseline must not alert, findings=%v", r.Findings)
+	}
+}
+
+// TestHealthSinceLateRecordRevealsRollback: a late record inserted into the
+// interval reveals a rollback; a later query reflects it.
+func TestHealthSinceLateRecordRevealsRollback(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	// Baseline seq 1 missed 5; interval looks monotonic: 5 -> 5 -> 7.
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{1, 5},
+		struct{ seq, missed int64 }{5, 5},
+		struct{ seq, missed int64 }{9, 7},
+	)
+	r1, err := store.HealthSince("n1", receive, "1.0", 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.MissedSinceUnknown || r1.NewMissed != 2 {
+		t.Errorf("before late record: unknown=%v newMissed=%d, want false/2",
+			r1.MissedSinceUnknown, r1.NewMissed)
+	}
+
+	// Late record seq 3 missed 1: adjacent pairs 1->3 (5->1) and 3->5 (1->5)
+	// reveal a rollback inside the interval.
+	if _, _, err := store.Submit([]Heartbeat{hb("n1", 3, receive.Add(-7*time.Second), "1.0", 103, 1)}, receive); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := store.HealthSince("n1", receive, "1.0", 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r2.MissedSinceUnknown {
+		t.Errorf("late record should reveal rollback, got newMissed=%d", r2.NewMissed)
+	}
+	if !hasFinding(r2.Findings, "累计漏签数回退") {
+		t.Errorf("expected rollback alert after late record, findings=%v", r2.Findings)
+	}
+}
+
+// TestHealthSinceBaselineErrors: invalid baselines are errors, never silently
+// substituted with another record or a zero baseline.
+func TestHealthSinceBaselineErrors(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{1, 5},
+		struct{ seq, missed int64 }{2, 7},
+	)
+
+	cases := []struct {
+		name string
+		seq  int64
+	}{
+		{"zero", 0},
+		{"negative", -1},
+		{"not stored", 99},
+		{"greater than latest", 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.HealthSince("n1", receive, "1.0", 1, tc.seq); err == nil {
+				t.Errorf("expected error for baseline seq %d", tc.seq)
+			}
+		})
+	}
+
+	// Node with no telemetry.
+	if _, err := store.HealthSince("ghost", receive, "1.0", 1, 1); err == nil {
+		t.Errorf("expected error for node with no telemetry")
+	}
+}
+
+// TestHealthSinceVersionSkewAndOfflineRemain: online status and version skew
+// are still reported with a baseline; the baseline only changes the missed
+// judgement.
+func TestHealthSinceVersionSkewAndOfflineRemain(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	// Latest telemetry is stale (2h old) and on the wrong version.
+	if _, _, err := store.Submit([]Heartbeat{
+		hb("n1", 1, receive.Add(-3*time.Hour), "1.0", 100, 0),
+		hb("n1", 2, receive.Add(-2*time.Hour), "0.9", 101, 5),
+	}, receive); err != nil {
+		t.Fatal(err)
+	}
+	r, err := store.HealthSince("n1", receive, "1.0", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "offline" {
+		t.Errorf("status=%s, want offline", r.Status)
+	}
+	if !hasFinding(r.Findings, "offline") {
+		t.Errorf("expected offline finding, findings=%v", r.Findings)
+	}
+	if !hasFinding(r.Findings, "version skew") {
+		t.Errorf("expected version skew finding, findings=%v", r.Findings)
+	}
+	// New missed 5 > 1 -> incremental alert too.
+	if r.NewMissed != 5 || !hasFinding(r.Findings, "new missed duties above tolerance") {
+		t.Errorf("newMissed=%d findings=%v, want 5 + new-missed alert", r.NewMissed, r.Findings)
+	}
+}
+
+// TestHealthSinceSeqGaps: gaps in seq are normal; the check still works.
+func TestHealthSinceSeqGaps(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{1, 10},
+		struct{ seq, missed int64 }{5, 10},
+		struct{ seq, missed int64 }{20, 13},
+	)
+	r, err := store.HealthSince("n1", receive, "1.0", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MissedSinceUnknown || r.NewMissed != 3 {
+		t.Errorf("gaps should be fine: unknown=%v newMissed=%d, want false/3", r.MissedSinceUnknown, r.NewMissed)
+	}
+}
+
+// TestHealthSinceRestartConsistency: after reopening the data directory the
+// saved baseline record is still usable.
+func TestHealthSinceRestartConsistency(t *testing.T) {
+	dir := t.TempDir()
+	receive := testBase
+	store1, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitSeqMissed(t, store1, receive,
+		struct{ seq, missed int64 }{1, 10},
+		struct{ seq, missed int64 }{2, 12},
+	)
+
+	store2, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := store2.HealthSince("n1", receive, "1.0", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SinceSeq != 1 || r.SinceMissed != 10 || r.NewMissed != 2 {
+		t.Errorf("after restart: sinceSeq=%d sinceMissed=%d newMissed=%d, want 1/10/2",
+			r.SinceSeq, r.SinceMissed, r.NewMissed)
+	}
+}
+
+// TestHealthSinceResubmitNoDoubleCount: re-submitting the same records does
+// not change the incremental count.
+func TestHealthSinceResubmitNoDoubleCount(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	batch := []Heartbeat{
+		hb("n1", 1, receive.Add(-2*time.Second), "1.0", 100, 10),
+		hb("n1", 2, receive.Add(-time.Second), "1.0", 101, 13),
+	}
+	if _, _, err := store.Submit(batch, receive); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Submit(batch, receive); err != nil {
+		t.Fatal(err)
+	}
+	r, err := store.HealthSince("n1", receive, "1.0", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.NewMissed != 3 {
+		t.Errorf("after resubmit newMissed=%d, want 3 (no double counting)", r.NewMissed)
+	}
+}
+
+// TestHealthSinceBaselineDoesNotAffectLegacy: a baseline query does not
+// change stored history or later queries without a baseline.
+func TestHealthSinceBaselineDoesNotAffectLegacy(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	submitSeqMissed(t, store, receive,
+		struct{ seq, missed int64 }{1, 10},
+		struct{ seq, missed int64 }{2, 14},
+	)
+	if _, err := store.HealthSince("n1", receive, "1.0", 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := store.Health("n1", receive, "1.0", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(rc.Findings, "missed duties above tolerance") {
+		t.Errorf("legacy judgement changed after baseline query, findings=%v", rc.Findings)
+	}
+	hist, err := store.History("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 {
+		t.Errorf("history changed after baseline query: %+v", hist)
 	}
 }
 

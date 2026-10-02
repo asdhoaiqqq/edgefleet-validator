@@ -320,6 +320,18 @@ type HealthResult struct {
 	Height      int64
 	Missed      int64
 	Findings    []string
+
+	// Baseline-based incremental missed inspection. SinceSeq is 0 when no
+	// baseline was requested (the legacy behaviour); the remaining fields
+	// are meaningful only when SinceSeq != 0. SinceMissed is the cumulative
+	// missed count of the baseline record; NewMissed is the number of new
+	// missed duties between the baseline and the latest record;
+	// MissedSinceUnknown is true when the cumulative count rolled back
+	// inside the interval, so NewMissed cannot be determined.
+	SinceSeq           int64
+	SinceMissed        int64
+	NewMissed          int64
+	MissedSinceUnknown bool
 }
 
 // Health judges a node from its latest telemetry (the record with the
@@ -329,6 +341,28 @@ type HealthResult struct {
 // (exactly 60s still online). Version skew and missed-duty rules follow the
 // existing Evaluate rules.
 func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, toleratedMisses int) (HealthResult, error) {
+	return s.health(nodeID, at, expectedVersion, toleratedMisses, 0)
+}
+
+// HealthSince judges a node's health with a baseline heartbeat: in addition
+// to the latest-telemetry judgement, it counts the new missed duties that
+// occurred between the stored record with seq sinceSeq and the latest record.
+// The baseline must be a stored, positive seq not greater than the latest
+// seq; otherwise an error is returned and no other record is substituted,
+// nor is the baseline count treated as zero. A cumulative missed decrease
+// between any two adjacent saved records inside the interval makes the new
+// count undeterminable ("累计漏签数回退"), even if the latest count later
+// recovers above the baseline. A decrease before the baseline is ignored.
+// The baseline affects only this query: stored history and later queries
+// without a baseline are unchanged.
+func (s *Store) HealthSince(nodeID string, at time.Time, expectedVersion string, toleratedMisses int, sinceSeq int64) (HealthResult, error) {
+	if sinceSeq <= 0 {
+		return HealthResult{}, fmt.Errorf("missed-since-seq must be a positive integer, got %d", sinceSeq)
+	}
+	return s.health(nodeID, at, expectedVersion, toleratedMisses, sinceSeq)
+}
+
+func (s *Store) health(nodeID string, at time.Time, expectedVersion string, toleratedMisses int, sinceSeq int64) (HealthResult, error) {
 	unlock, err := s.lock(false)
 	if err != nil {
 		return HealthResult{}, err
@@ -340,6 +374,9 @@ func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, tole
 		return HealthResult{}, err
 	}
 	if nf == nil || len(nf.Records) == 0 {
+		if sinceSeq > 0 {
+			return HealthResult{}, fmt.Errorf("cannot use --missed-since-seq %d: node %q has no telemetry", sinceSeq, nodeID)
+		}
 		return HealthResult{NodeID: nodeID, Status: "notelemetry", Findings: []string{"无遥测"}}, nil
 	}
 
@@ -365,13 +402,19 @@ func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, tole
 		Missed:  int(latest.Missed),
 		Online:  online,
 	}
-	h := Evaluate(node, expectedVersion, toleratedMisses)
+	// With a baseline, missed duties are judged by the incremental count;
+	// the cumulative count must not produce its own alert.
+	evalNode := node
+	if sinceSeq > 0 {
+		evalNode.Missed = 0
+	}
+	h := Evaluate(evalNode, expectedVersion, toleratedMisses)
 
 	status := "online"
 	if !online {
 		status = "offline"
 	}
-	return HealthResult{
+	result := HealthResult{
 		NodeID:      nodeID,
 		Status:      status,
 		Seq:         latest.Seq,
@@ -380,7 +423,58 @@ func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, tole
 		Height:      latest.Height,
 		Missed:      latest.Missed,
 		Findings:    h.Findings,
-	}, nil
+	}
+
+	if sinceSeq > 0 {
+		// Locate the baseline record. Records are sorted by ascending seq
+		// with no duplicates, so the first match is the only one.
+		var baseline Heartbeat
+		found := false
+		for _, r := range nf.Records {
+			if r.Seq == sinceSeq {
+				baseline = r
+				found = true
+				break
+			}
+		}
+		if !found {
+			if sinceSeq > latest.Seq {
+				return HealthResult{}, fmt.Errorf("cannot use --missed-since-seq %d: it is greater than the latest stored seq %d for node %q",
+					sinceSeq, latest.Seq, nodeID)
+			}
+			return HealthResult{}, fmt.Errorf("cannot use --missed-since-seq %d: no stored heartbeat with that seq for node %q",
+				sinceSeq, nodeID)
+		}
+		result.SinceSeq = baseline.Seq
+		result.SinceMissed = baseline.Missed
+
+		// Inspect every adjacent saved pair inside [baseline, latest]. A
+		// cumulative decrease between any such pair makes the new count
+		// undeterminable, even if the latest count later recovers. Seq gaps
+		// are normal and do not affect the check.
+		rolledBack := false
+		prev := baseline
+		for _, r := range nf.Records {
+			if r.Seq <= sinceSeq {
+				continue
+			}
+			if r.Missed < prev.Missed {
+				rolledBack = true
+			}
+			prev = r
+		}
+		if rolledBack {
+			result.MissedSinceUnknown = true
+			result.Findings = append(result.Findings, "累计漏签数回退")
+		} else {
+			result.NewMissed = latest.Missed - baseline.Missed
+			if result.NewMissed > int64(toleratedMisses) {
+				result.Findings = append(result.Findings, "new missed duties above tolerance")
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // History returns all heartbeats for a node in ascending seq order, without
