@@ -43,26 +43,51 @@ type windowState struct {
 }
 
 // RunAggregate reads line-delimited JSON records from r and writes closed
-// window results, one JSON object per line, to out. windowMillis must be a
-// positive signed 64-bit integer. Windows are fixed-length, start at time
-// zero and use a left-closed right-open interval. Closure is driven solely by
-// input watermarks: a window whose end is less than or equal to the current
-// watermark is emitted once, ordered by end ascending and then by key in
-// UTF-8 byte order. Late events (event time below the current watermark) are
-// reported on lateLog with their physical line number and skipped. Fatal
+// fixed window results, one JSON object per line, to out. windowMillis must
+// be a positive signed 64-bit integer. Windows are fixed-length, start at
+// time zero and use a left-closed right-open interval. Closure is driven
+// solely by input watermarks: a window whose end is less than or equal to the
+// current watermark is emitted once, ordered by end ascending and then by key
+// in UTF-8 byte order. Late events (event time below the current watermark)
+// are reported on lateLog with their physical line number and skipped. Fatal
 // record problems return *InputError; results already written to out stay
 // written, and open windows are not flushed at end of input.
 //
 // This is the legacy single-watermark mode: records carry no partition field
 // and any extra fields are ignored. Use RunAggregatePartitioned to merge
-// several independent input sources of the same stream.
+// several independent input sources of the same stream, or
+// RunAggregateSliding to emit overlapping windows at a shorter interval.
 func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Writer) error {
-	return RunAggregatePartitioned(r, windowMillis, 0, out, lateLog)
+	return RunAggregatePartitionedSliding(r, windowMillis, windowMillis, 0, out, lateLog)
 }
 
-// RunAggregatePartitioned reads line-delimited JSON records from r and writes
-// closed window results, one JSON object per line, to out. windowMillis must
-// be a positive signed 64-bit integer. partitions selects the input mode:
+// RunAggregateSliding is RunAggregate with overlapping sliding windows. The
+// window length is windowMillis and consecutive window starts are slideMillis
+// apart, beginning at time zero: 0, slideMillis, 2*slideMillis, ... Each
+// window is left-closed right-open and no window with a negative start is
+// created. slideMillis must be a positive signed 64-bit integer no greater
+// than windowMillis and does not have to divide it; slideMillis equal to
+// windowMillis is exactly RunAggregate's fixed-window behavior. A valid event
+// is counted once in every window that contains its event time, adding to
+// that window's per-key count and the full value to its sum. Everything else
+// (watermark-only closure, ordering, late reporting, overflow handling and
+// end-of-input behavior) is identical to RunAggregate.
+func RunAggregateSliding(r io.Reader, windowMillis, slideMillis int64, out io.Writer, lateLog io.Writer) error {
+	return RunAggregatePartitionedSliding(r, windowMillis, slideMillis, 0, out, lateLog)
+}
+
+// RunAggregatePartitioned is RunAggregatePartitionedSliding with slideMillis
+// equal to windowMillis (non-overlapping fixed windows).
+func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
+	return RunAggregatePartitionedSliding(r, windowMillis, windowMillis, partitions, out, lateLog)
+}
+
+// RunAggregatePartitionedSliding combines sliding windows (see
+// RunAggregateSliding) with partitioned inputs: events from different
+// partitions merge into one count and sum per key and window, and both the
+// late-event check and window closure use the effective (minimum) watermark.
+// windowMillis and slideMillis are validated exactly as in
+// RunAggregateSliding. partitions selects the input mode:
 //
 //   - partitions == 0: legacy single-watermark mode. Records do not carry a
 //     partition field; any extra fields are ignored.
@@ -94,16 +119,23 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 //
 // partitions < 0 is an error. Windows, ordering, late-event reporting,
 // overflow checks and end-of-input behavior are otherwise identical to
-// RunAggregate.
-func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
+// RunAggregateSliding.
+func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
 	if windowMillis <= 0 {
 		return fmt.Errorf("window length must be a positive signed 64-bit integer, got %d", windowMillis)
+	}
+	if slideMillis <= 0 {
+		return fmt.Errorf("slide interval must be a positive signed 64-bit integer, got %d", slideMillis)
+	}
+	if slideMillis > windowMillis {
+		return fmt.Errorf("slide interval %d must not exceed window length %d", slideMillis, windowMillis)
 	}
 	if partitions < 0 {
 		return fmt.Errorf("partition count must be a positive signed 64-bit integer, got %d", partitions)
 	}
 	s := &aggregateState{
 		windowMillis:  windowMillis,
+		slideMillis:   slideMillis,
 		windows:       make(map[windowID]*windowState),
 		out:           out,
 		lateLog:       lateLog,
@@ -130,6 +162,7 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 
 type aggregateState struct {
 	windowMillis int64
+	slideMillis  int64 // distance between consecutive window starts; equals windowMillis for fixed windows
 	windows      map[windowID]*windowState
 	out          io.Writer
 	lateLog      io.Writer
@@ -172,6 +205,65 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 	}
 }
 
+// floorDiv returns math.Floor(a/b) for b > 0; Go's / truncates toward zero,
+// so negative numerators need explicit adjustment.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
+}
+
+// containingWindowBounds returns the first and last (inclusive) window index
+// whose window [k*slideMillis, k*slideMillis+windowMillis) contains
+// eventTime. Windows start at 0, slideMillis, 2*slideMillis, ... and none
+// with a negative start is created, so the first index is clamped to zero.
+// The last index is eventTime/slideMillis, so an event at a window end is
+// outside that window.
+func (s *aggregateState) containingWindowBounds(eventTime int64) (first, last int64) {
+	last = eventTime / s.slideMillis
+	first = floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
+	if first < 0 {
+		first = 0
+	}
+	return first, last
+}
+
+// containingWindowCount returns how many windows contain eventTime.
+func (s *aggregateState) containingWindowCount(eventTime int64) int64 {
+	first, last := s.containingWindowBounds(eventTime)
+	return last - first + 1
+}
+
+// containingStart returns the start of the containing window reached back by
+// offset indices from the last one (offset 0 = last window).
+func (s *aggregateState) containingStart(eventTime, offset int64) int64 {
+	last := eventTime - eventTime%s.slideMillis
+	return last - offset*s.slideMillis
+}
+
+// firstOverflowingStart reports the start of the earliest containing window
+// whose end (start + windowMillis) leaves the signed 64-bit range, or -1 when
+// every containing window fits. Containing starts are an ascending arithmetic
+// sequence with step slideMillis, so overflow (if any) is a suffix; this
+// computes its first member directly instead of walking the sequence.
+func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
+	n := s.containingWindowCount(eventTime)
+	lowest := s.containingStart(eventTime, n-1) // earliest containing start; never negative
+	maxSafeStart := int64(math.MaxInt64 - s.windowMillis)
+	if lowest > maxSafeStart {
+		return lowest
+	}
+	safe := (maxSafeStart-lowest)/s.slideMillis + 1 // number of containing starts that fit
+	if safe < n {
+		// Reach back from last, which is at most eventTime, so the
+		// subtraction cannot leave the signed 64-bit range.
+		return s.containingStart(eventTime, n-1-safe)
+	}
+	return -1
+}
+
 func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
 	key, err := requiredString(obj, "key", lineNo)
 	if err != nil {
@@ -201,29 +293,38 @@ func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int
 		return nil
 	}
 
-	start := eventTime - eventTime%s.windowMillis
-	if start > math.MaxInt64-s.windowMillis {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, start, s.windowMillis)}
-	}
-	end := start + s.windowMillis
+	n := s.containingWindowCount(eventTime)
 
-	id := windowID{start: start, key: key}
-	st := s.windows[id]
-	if st == nil {
-		st = &windowState{end: end}
-		s.windows[id] = st
+	// A window whose end leaves the signed 64-bit range is fatal for the
+	// whole input line; check before updating any window state.
+	if badStart := s.firstOverflowingStart(eventTime); badStart >= 0 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, badStart, s.windowMillis)}
 	}
-	if st.count == math.MaxInt64 {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", key, start, end)}
+
+	// Add the event once to each containing window, in ascending start
+	// order. An overflow here stops processing immediately; already closed
+	// (and thus already written) windows are unaffected.
+	for i := n - 1; i >= 0; i-- {
+		start := s.containingStart(eventTime, i)
+		end := start + s.windowMillis
+		id := windowID{start: start, key: key}
+		st := s.windows[id]
+		if st == nil {
+			st = &windowState{end: end}
+			s.windows[id] = st
+		}
+		if st.count == math.MaxInt64 {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", key, start, end)}
+		}
+		if value > 0 && st.sum > math.MaxInt64-value {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
+		}
+		if value < 0 && st.sum < math.MinInt64-value {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
+		}
+		st.count++
+		st.sum += value
 	}
-	if value > 0 && st.sum > math.MaxInt64-value {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
-	}
-	if value < 0 && st.sum < math.MinInt64-value {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
-	}
-	st.count++
-	st.sum += value
 	return nil
 }
 
