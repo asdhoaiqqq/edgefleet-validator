@@ -66,6 +66,7 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 //
 //   - partitions == 0: legacy single-watermark mode. Records do not carry a
 //     partition field; any extra fields are ignored.
+//
 //   - partitions > 0: partitioned mode, merging partitions independent input
 //     sources of the same stream. Every event and watermark record must carry
 //     an integer "partition" in [0,partitions). Each partition advances its
@@ -75,6 +76,21 @@ func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Wri
 //     checks use this minimum, so one partition's larger watermark can never
 //     close a window or drop an event ahead of the others. A partition
 //     watermark may repeat or jump forward but never move backwards.
+//
+//     A partition may be declared idle with
+//     {"type":"idle","partition":p}. An idle partition stops contributing to
+//     the effective watermark: non-idle partitions that have not reported a
+//     watermark yet still keep the effective watermark unknown, while a
+//     partition that never reported may itself be declared idle. When every
+//     remaining (non-idle) partition has reported, the effective watermark is
+//     their minimum and the idle record itself can close windows. If all
+//     partitions are idle, the last produced effective watermark is retained;
+//     when none was ever produced it stays unknown. Idleness is declared by
+//     the input only, never inferred from time; a repeated idle declaration
+//     is a no-op. The next watermark record for that partition resumes it:
+//     its time must be at least both the partition's previous watermark and
+//     the current effective watermark. An event for an idle partition is
+//     fatal; it never resumes implicitly.
 //
 // partitions < 0 is an error. Windows, ordering, late-event reporting,
 // overflow checks and end-of-input behavior are otherwise identical to
@@ -93,6 +109,7 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 		lateLog:       lateLog,
 		partitions:    partitions,
 		partWatermark: make(map[int64]*int64),
+		idle:          make(map[int64]bool),
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -120,6 +137,7 @@ type aggregateState struct {
 	partitions    int64 // 0 = legacy single-watermark mode
 	watermark     *int64
 	partWatermark map[int64]*int64 // partition -> last watermark; partitioned mode only
+	idle          map[int64]bool   // partitions declared idle in the input; partitioned mode only
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
@@ -142,6 +160,13 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 		return s.processEvent(obj, lineNo)
 	case "watermark":
 		return s.processWatermark(obj, lineNo)
+	case "idle":
+		// Only partitioned mode knows idle declarations; legacy
+		// single-watermark mode treats it as any unknown record type.
+		if s.partitions == 0 {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
+		}
+		return s.processIdle(obj, lineNo)
 	default:
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
 	}
@@ -163,8 +188,12 @@ func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int
 	if err != nil {
 		return err
 	}
-	if _, err := s.requiredPartition(obj, lineNo); err != nil {
+	p, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
 		return err
+	}
+	if s.partitions > 0 && s.idle[p] {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event for idle partition %d is not allowed; send a watermark to resume it first", p)}
 	}
 
 	if s.watermark != nil && eventTime < *s.watermark {
@@ -214,11 +243,25 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 		}
 		s.watermark = &next
 	} else {
-		if prev, ok := s.partWatermark[p]; ok && next < *prev {
+		resuming := s.idle[p]
+		if resuming {
+			// A resume watermark must be at least the partition's previous
+			// watermark and the effective watermark produced while it was
+			// idle; equality on either boundary resumes.
+			if prev, ok := s.partWatermark[p]; ok && next < *prev {
+				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below its previous watermark %d", next, p, *prev)}
+			}
+			if s.watermark != nil && next < *s.watermark {
+				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below the current effective watermark %d", next, p, *s.watermark)}
+			}
+			delete(s.idle, p)
+		} else if prev, ok := s.partWatermark[p]; ok && next < *prev {
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
 		}
 		s.partWatermark[p] = &next
-		s.watermark = s.effectiveWatermark()
+		if effective := s.effectiveWatermark(); effective != nil {
+			s.watermark = effective
+		}
 	}
 
 	if s.watermark == nil {
@@ -227,15 +270,51 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 	return s.closeWindows(*s.watermark)
 }
 
-// effectiveWatermark returns the minimum of the per-partition watermarks once
-// every partition has reported at least one, or nil otherwise.
+// processIdle declares a partition idle: it stops contributing to the
+// effective watermark until its next watermark record. The declaration
+// itself may advance the effective watermark and close windows.
+func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int) error {
+	p, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
+		return err
+	}
+	wasIdle := s.idle[p]
+	s.idle[p] = true
+
+	// Recompute the effective watermark. With the partition excluded, the
+	// remaining non-idle partitions determine it; if every partition is idle
+	// the last produced effective watermark is retained instead of clearing.
+	// Repeated idle declarations do not change the state of the windows.
+	if !wasIdle {
+		if next := s.effectiveWatermark(); next != nil {
+			s.watermark = next
+		}
+	}
+	if s.watermark == nil {
+		return nil
+	}
+	return s.closeWindows(*s.watermark)
+}
+
+// effectiveWatermark returns the minimum watermark over the non-idle
+// partitions once each of them has reported at least once, or nil
+// otherwise. When every partition is idle, nil is returned so the caller
+// keeps the last produced effective watermark.
 func (s *aggregateState) effectiveWatermark() *int64 {
-	if len(s.partWatermark) != int(s.partitions) {
+	active := s.partitions - int64(len(s.idle))
+	if active <= 0 {
 		return nil
 	}
 	var min int64
 	first := true
-	for _, w := range s.partWatermark {
+	for p := int64(0); p < s.partitions; p++ {
+		if s.idle[p] {
+			continue
+		}
+		w, ok := s.partWatermark[p]
+		if !ok {
+			return nil
+		}
 		if first || *w < min {
 			min = *w
 			first = false
