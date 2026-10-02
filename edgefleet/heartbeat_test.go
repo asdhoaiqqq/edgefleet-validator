@@ -70,6 +70,21 @@ func TestParseHeartbeatsInvalid(t *testing.T) {
 		{"height negative", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":-1,"missed":0}]`},
 		{"missed negative", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":-1}]`},
 		{"record not object", `[42]`},
+		{"node null", `[{"node":null,"seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"seq null", `[{"node":"val-1","seq":null,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"collected_at null", `[{"node":"val-1","seq":1,"collected_at":null,"version":"1.0","height":1,"missed":0}]`},
+		{"version null", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":null,"height":1,"missed":0}]`},
+		{"height null", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0}]`},
+		{"missed null", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":null}]`},
+		{"duplicate missed same value", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":0}]`},
+		{"duplicate missed diff value", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`},
+		{"duplicate height", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"height":2,"missed":0}]`},
+		{"duplicate node", `[{"node":"a","node":"b","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"duplicate seq", `[{"node":"val-1","seq":1,"seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"duplicate collected_at", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"duplicate version", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","version":"2.0","height":1,"missed":0}]`},
+		{"duplicate via unicode escape", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`},
+		{"duplicate via unicode escape reversed", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -814,6 +829,205 @@ func TestParseHeartbeatsErrorMessageSpecific(t *testing.T) {
 	_, err = ParseHeartbeats([]byte(`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00","version":"1.0","height":1,"missed":0}]`), testBase)
 	if err == nil || !strings.Contains(err.Error(), "timezone") {
 		t.Errorf("error should mention timezone: %v", err)
+	}
+}
+
+func TestParseHeartbeatsNullErrorMessages(t *testing.T) {
+	cases := []struct {
+		input string
+		field string
+	}{
+		{`[{"node":null,"seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`, "node"},
+		{`[{"node":"n1","seq":null,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`, "seq"},
+		{`[{"node":"n1","seq":1,"collected_at":null,"version":"1.0","height":1,"missed":0}]`, "collected_at"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":null,"height":1,"missed":0}]`, "version"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0}]`, "height"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":null}]`, "missed"},
+	}
+	for _, tc := range cases {
+		_, err := ParseHeartbeats([]byte(tc.input), testBase)
+		if err == nil {
+			t.Errorf("expected error for null %s, got nil", tc.field)
+			continue
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, tc.field) {
+			t.Errorf("error for null %s should mention field name, got: %v", tc.field, err)
+		}
+		if !strings.Contains(msg, "null") {
+			t.Errorf("error for null %s should mention null, got: %v", tc.field, err)
+		}
+	}
+}
+
+func TestParseHeartbeatsDuplicateErrorMessages(t *testing.T) {
+	cases := []struct {
+		input string
+		field string
+	}{
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":0}]`, "missed"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`, "missed"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"height":2,"missed":0}]`, "height"},
+		{`[{"node":"a","node":"b","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`, "node"},
+		{`[{"node":"n1","seq":1,"seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`, "seq"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`, "collected_at"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","version":"2.0","height":1,"missed":0}]`, "version"},
+		// Unicode escape variants of the same field name.
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`, "missed"},
+		{`[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}]`, "missed"},
+	}
+	for _, tc := range cases {
+		_, err := ParseHeartbeats([]byte(tc.input), testBase)
+		if err == nil {
+			t.Errorf("expected error for duplicate %s, got nil", tc.field)
+			continue
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, tc.field) {
+			t.Errorf("error for duplicate %s should mention field name, got: %v", tc.field, err)
+		}
+		if !strings.Contains(msg, "duplicate") {
+			t.Errorf("error for duplicate %s should mention duplicate, got: %v", tc.field, err)
+		}
+	}
+}
+
+func TestParseHeartbeatsRecordPosition(t *testing.T) {
+	// Error record at index 0 (position 1).
+	_, err := ParseHeartbeats([]byte(`[
+		{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0},
+		{"node":"n2","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}
+	]`), testBase)
+	if err == nil || !strings.Contains(err.Error(), "record 1") {
+		t.Errorf("error should mention record 1, got: %v", err)
+	}
+
+	// Error record at index 1 (position 2).
+	_, err = ParseHeartbeats([]byte(`[
+		{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0},
+		{"node":"n2","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":null}
+	]`), testBase)
+	if err == nil || !strings.Contains(err.Error(), "record 2") {
+		t.Errorf("error should mention record 2, got: %v", err)
+	}
+
+	// Error record at index 2 (position 3).
+	_, err = ParseHeartbeats([]byte(`[
+		{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0},
+		{"node":"n2","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0},
+		{"node":"n3","seq":3,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}
+	]`), testBase)
+	if err == nil || !strings.Contains(err.Error(), "record 3") {
+		t.Errorf("error should mention record 3, got: %v", err)
+	}
+}
+
+func TestParseHeartbeatsUnicodeEscapeAccepted(t *testing.T) {
+	// A single field written with a Unicode escape is still the same field
+	// and must be accepted.
+	input := `[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":12345,"missed":0}]`
+	records, err := ParseHeartbeats([]byte(input), testBase)
+	if err != nil {
+		t.Fatalf("single escaped field should be accepted: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].Height != 12345 || records[0].Missed != 0 {
+		t.Errorf("escaped field value wrong: height=%d missed=%d", records[0].Height, records[0].Missed)
+	}
+}
+
+func TestParseHeartbeatsLargeIntegerPreserved(t *testing.T) {
+	// Large integers must retain their exact value through parsing.
+	input := `[{"node":"n1","seq":9223372036854775807,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":9223372036854775806,"missed":9223372036854775805}]`
+	records, err := ParseHeartbeats([]byte(input), testBase)
+	if err != nil {
+		t.Fatalf("large integer should be accepted: %v", err)
+	}
+	if records[0].Seq != 9223372036854775807 {
+		t.Errorf("seq = %d, want 9223372036854775807", records[0].Seq)
+	}
+	if records[0].Height != 9223372036854775806 {
+		t.Errorf("height = %d, want 9223372036854775806", records[0].Height)
+	}
+	if records[0].Missed != 9223372036854775805 {
+		t.Errorf("missed = %d, want 9223372036854775805", records[0].Missed)
+	}
+}
+
+func TestBatchRejectionOnInputError(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+
+	// Pre-existing data for node n1.
+	first := hb("n1", 1, receive.Add(-time.Minute), "1.0", 100, 0)
+	if _, _, err := store.Submit([]Heartbeat{first}, receive); err != nil {
+		t.Fatal(err)
+	}
+
+	// A batch with one null record and one valid record: nothing is saved,
+	// not even the valid record.
+	input := `[
+		{"node":"n1","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0},
+		{"node":"n2","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}
+	]`
+	records, err := ParseHeartbeats([]byte(input), receive)
+	if err == nil {
+		t.Fatalf("expected error for null record")
+	}
+	if records != nil {
+		t.Errorf("ParseHeartbeats should return nil records on error, got %v", records)
+	}
+
+	// Pre-existing data is unchanged.
+	hist, err := store.History("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 || hist[0].Seq != 1 {
+		t.Errorf("n1 history changed after rejected batch: %+v", hist)
+	}
+
+	// New node n2 has no telemetry.
+	r, err := store.Health("n2", receive, "1.0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "notelemetry" {
+		t.Errorf("n2 status=%s, want notelemetry", r.Status)
+	}
+}
+
+func TestBatchRejectionOnDuplicateField(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+
+	// A batch with one duplicate-field record: nothing is saved.
+	input := `[
+		{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0},
+		{"node":"n2","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"missed":1}
+	]`
+	_, err = ParseHeartbeats([]byte(input), receive)
+	if err == nil {
+		t.Fatalf("expected error for duplicate field")
+	}
+
+	// Neither node has any records.
+	for _, node := range []string{"n1", "n2"} {
+		hist, err := store.History(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hist) != 0 {
+			t.Errorf("node %s got records despite rejected batch: %+v", node, hist)
+		}
 	}
 }
 

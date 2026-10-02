@@ -1,6 +1,7 @@
 package edgefleet
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -91,11 +92,54 @@ func ParseHeartbeats(data []byte, receiveTime time.Time) ([]Heartbeat, error) {
 	return records, nil
 }
 
+// rejectNull reports an error when a required field's JSON value is null.
+// A null value means the node did not report the field, which must not be
+// silently saved as the zero value.
+func rejectNull(raw json.RawMessage, field string) error {
+	if bytes.Equal(raw, []byte("null")) {
+		return fmt.Errorf("%s must not be null", field)
+	}
+	return nil
+}
+
 func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	// Walk the object with a streaming decoder so duplicate field names are
+	// detected. Field names are compared as the JSON string they represent:
+	// "missed" and "m\u0069ssed" are the same field. A map-based unmarshal
+	// would silently keep only the last occurrence.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
 		return Heartbeat{}, fmt.Errorf("record must be a JSON object: %w", err)
 	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return Heartbeat{}, fmt.Errorf("record must be a JSON object")
+	}
+
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return Heartbeat{}, fmt.Errorf("invalid field: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return Heartbeat{}, fmt.Errorf("field name must be a string")
+		}
+		if _, exists := fields[key]; exists {
+			return Heartbeat{}, fmt.Errorf("duplicate field %q", key)
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return Heartbeat{}, fmt.Errorf("invalid value for field %q: %w", key, err)
+		}
+		fields[key] = val
+	}
+	// Consume the closing brace.
+	if _, err := dec.Token(); err != nil {
+		return Heartbeat{}, fmt.Errorf("invalid record: %w", err)
+	}
+
 	for _, f := range heartbeatFields {
 		if _, ok := fields[f]; !ok {
 			return Heartbeat{}, fmt.Errorf("missing required field %q", f)
@@ -109,6 +153,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 
 	var h Heartbeat
 
+	if err := rejectNull(fields["node"], "node"); err != nil {
+		return Heartbeat{}, err
+	}
 	if err := json.Unmarshal(fields["node"], &h.NodeID); err != nil {
 		return Heartbeat{}, fmt.Errorf("node must be a string: %w", err)
 	}
@@ -116,6 +163,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("node must not be empty")
 	}
 
+	if err := rejectNull(fields["seq"], "seq"); err != nil {
+		return Heartbeat{}, err
+	}
 	if err := json.Unmarshal(fields["seq"], &h.Seq); err != nil {
 		return Heartbeat{}, fmt.Errorf("seq must be an integer: %w", err)
 	}
@@ -123,6 +173,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
 	}
 
+	if err := rejectNull(fields["collected_at"], "collected_at"); err != nil {
+		return Heartbeat{}, err
+	}
 	var collectedStr string
 	if err := json.Unmarshal(fields["collected_at"], &collectedStr); err != nil {
 		return Heartbeat{}, fmt.Errorf("collected_at must be a string: %w", err)
@@ -133,6 +186,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 	}
 	h.CollectedAt = t
 
+	if err := rejectNull(fields["version"], "version"); err != nil {
+		return Heartbeat{}, err
+	}
 	if err := json.Unmarshal(fields["version"], &h.Version); err != nil {
 		return Heartbeat{}, fmt.Errorf("version must be a string: %w", err)
 	}
@@ -140,6 +196,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("version must not be empty")
 	}
 
+	if err := rejectNull(fields["height"], "height"); err != nil {
+		return Heartbeat{}, err
+	}
 	if err := json.Unmarshal(fields["height"], &h.Height); err != nil {
 		return Heartbeat{}, fmt.Errorf("height must be an integer: %w", err)
 	}
@@ -147,6 +206,9 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("height must be >= 0, got %d", h.Height)
 	}
 
+	if err := rejectNull(fields["missed"], "missed"); err != nil {
+		return Heartbeat{}, err
+	}
 	if err := json.Unmarshal(fields["missed"], &h.Missed); err != nil {
 		return Heartbeat{}, fmt.Errorf("missed must be an integer: %w", err)
 	}
