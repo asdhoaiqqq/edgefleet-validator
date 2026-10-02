@@ -9,8 +9,15 @@
 ```bash
 go run ./cmd/edgefleet demo
 go run ./cmd/edgefleet version
+go run ./cmd/edgefleet help
+printf '%s\n' \
+  '{"type":"event","key":"sensor-a","time":1200,"value":5}' \
+  '{"type":"watermark","time":2000}' \
+  | go run ./cmd/edgefleet aggregate --window-ms 1000
 go test ./...
 ```
+
+`aggregate` 从标准输入读取逐行 JSON 事件与水位线记录，按事件时间汇总固定长度窗口（左闭右开，从时间零开始），只在输入水位线推进时输出 end ≤ 水位线的窗口；完全离线，不使用当前时间。详见 `go run ./cmd/edgefleet help`。
 
 ## 技术方向
 
