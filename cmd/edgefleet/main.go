@@ -124,8 +124,22 @@ func heartbeatUsage() {
 	fmt.Println("  health   --node ID             node id (required)")
 	fmt.Println("           --expected-version V  expected version (required)")
 	fmt.Println("           --tolerated-misses N  tolerated missed duties, >= 0 (required)")
+	fmt.Println("           --missed-since-seq S  seq of a saved heartbeat used as the")
+	fmt.Println("                                missed-duty baseline (optional, > 0)")
 	fmt.Println("           --at TIME             query time, RFC3339 (default: now)")
 	fmt.Println("           --data-dir DIR        data directory")
+	fmt.Println()
+	fmt.Println("  Without --missed-since-seq the missed-duty alarm uses the cumulative")
+	fmt.Println("  missed count of the latest heartbeat (missed in the output). With it,")
+	fmt.Println("  the alarm counts only missed duties newly recorded between the baseline")
+	fmt.Println("  heartbeat seq S and the latest one; a count strictly greater than")
+	fmt.Println("  --tolerated-misses alarms, equality does not. The output then shows the")
+	fmt.Println("  baseline seq, the baseline cumulative count and the new count. If the")
+	fmt.Println("  cumulative counter decreased between the baseline and the latest record")
+	fmt.Println("  (e.g. after a node reset), the new count is shown as 无法判断 and a")
+	fmt.Println("  累计漏签数回退 finding is reported; the baseline must name an existing")
+	fmt.Println("  saved seq, otherwise the command fails.")
+	fmt.Println()
 	fmt.Println("  history  --node ID             node id (required)")
 	fmt.Println("           --data-dir DIR        data directory")
 	fmt.Println()
@@ -185,6 +199,7 @@ func cmdHealth(args []string) {
 	atStr := fs.String("at", "", "query time (RFC3339); default: now")
 	expectedVersion := fs.String("expected-version", "", "expected version (required)")
 	toleratedMisses := fs.Int("tolerated-misses", -1, "tolerated missed duties, >= 0 (required)")
+	missedSinceSeq := fs.Int64("missed-since-seq", 0, "seq of a saved heartbeat to use as the missed-duty baseline; must be > 0 and exist for the node")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			os.Exit(0)
@@ -200,6 +215,9 @@ func cmdHealth(args []string) {
 	if *toleratedMisses < 0 {
 		die("--tolerated-misses is required and must be >= 0")
 	}
+	if isFlagPassed(fs, "missed-since-seq") && *missedSinceSeq <= 0 {
+		die("--missed-since-seq must be a positive integer")
+	}
 
 	at := parseTimeFlag(*atStr, "--at")
 
@@ -207,7 +225,13 @@ func cmdHealth(args []string) {
 	if err != nil {
 		die("%v", err)
 	}
-	result, err := store.Health(*node, at, *expectedVersion, *toleratedMisses)
+
+	var result edgefleet.HealthResult
+	if isFlagPassed(fs, "missed-since-seq") {
+		result, err = store.HealthSince(*node, at, *expectedVersion, *toleratedMisses, *missedSinceSeq)
+	} else {
+		result, err = store.Health(*node, at, *expectedVersion, *toleratedMisses)
+	}
 	if err != nil {
 		die("%v", err)
 	}
@@ -219,6 +243,29 @@ func cmdHealth(args []string) {
 	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
 		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
 		result.Version, result.Height, result.Missed, result.Findings)
+	if isFlagPassed(fs, "missed-since-seq") {
+		// missed above stays cumulative; this line states the alarm basis.
+		if result.NewMissedKnown {
+			fmt.Printf("baseline_seq=%d baseline_missed=%d new_missed=%d tolerated_misses=%d\n",
+				result.BaselineSeq, result.BaselineMissed, result.NewMissed, *toleratedMisses)
+		} else {
+			fmt.Printf("baseline_seq=%d baseline_missed=%d new_missed=无法判断 tolerated_misses=%d\n",
+				result.BaselineSeq, result.BaselineMissed, *toleratedMisses)
+		}
+	}
+}
+
+// isFlagPassed reports whether the named flag was explicitly set on the
+// command line, so an optional flag with a zero default can be distinguished
+// from its absence.
+func isFlagPassed(fs *flag.FlagSet, name string) bool {
+	passed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			passed = true
+		}
+	})
+	return passed
 }
 
 func cmdHistory(args []string) {

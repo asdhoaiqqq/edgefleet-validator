@@ -318,9 +318,26 @@ type HealthResult struct {
 	CollectedAt time.Time
 	Version     string
 	Height      int64
-	Missed      int64
+	Missed      int64 // cumulative missed duties at the latest heartbeat
 	Findings    []string
+
+	// Baseline-relative missed duties, populated only by HealthSince.
+	// BaselineSeq is the seq of the heartbeat the query was anchored to;
+	// BaselineMissed is the cumulative count at that heartbeat. When
+	// NewMissedKnown is false the cumulative counter went backwards
+	// somewhere between the baseline and the latest record, so the number of
+	// newly missed duties cannot be derived; Findings then reports the
+	// rollback. Missed always remains the latest cumulative count.
+	BaselineSeq    int64
+	BaselineMissed int64
+	NewMissed      int64
+	NewMissedKnown bool
 }
+
+// rollbackFinding warns that the cumulative missed-duty counter decreased
+// between two adjacent saved heartbeats (typically a node counter reset),
+// which makes the endpoint difference unusable as the new-miss count.
+const rollbackFinding = "累计漏签数回退"
 
 // Health judges a node from its latest telemetry (the record with the
 // greatest seq). A node with no heartbeats returns Status "notelemetry". A
@@ -329,6 +346,34 @@ type HealthResult struct {
 // (exactly 60s still online). Version skew and missed-duty rules follow the
 // existing Evaluate rules.
 func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, toleratedMisses int) (HealthResult, error) {
+	return s.health(nodeID, at, expectedVersion, toleratedMisses, 0, false)
+}
+
+// HealthSince judges a node the same way Health does, but the missed-duty
+// alarm is measured against a user-supplied baseline heartbeat instead of the
+// cumulative counter alone. baselineSeq must be the seq (> 0) of a record
+// already saved for the node: the latest heartbeat stays the record with the
+// greatest seq, and new missed duties are the latest cumulative count minus
+// the count at the baseline record. Only a strict excess over
+// toleratedMisses alarms; equality does not.
+//
+// The baseline affects this query only: stored history is never modified.
+// Seqs between the baseline and the latest may have gaps. If the cumulative
+// count decreases between any two adjacent saved records in that interval the
+// new count is reported as unknown (NewMissedKnown == false) and a rollback
+// finding is emitted, even if the latest count later climbs back past the
+// baseline; decreases before the baseline are irrelevant. A node without
+// telemetry, an unknown baseline seq, or a baseline newer than the latest
+// record is an error — no other record is substituted and the baseline count
+// is never assumed to be zero.
+func (s *Store) HealthSince(nodeID string, at time.Time, expectedVersion string, toleratedMisses int, baselineSeq int64) (HealthResult, error) {
+	if baselineSeq <= 0 {
+		return HealthResult{}, fmt.Errorf("--missed-since-seq must be a positive integer, got %d", baselineSeq)
+	}
+	return s.health(nodeID, at, expectedVersion, toleratedMisses, baselineSeq, true)
+}
+
+func (s *Store) health(nodeID string, at time.Time, expectedVersion string, toleratedMisses int, baselineSeq int64, useBaseline bool) (HealthResult, error) {
 	unlock, err := s.lock(false)
 	if err != nil {
 		return HealthResult{}, err
@@ -340,13 +385,18 @@ func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, tole
 		return HealthResult{}, err
 	}
 	if nf == nil || len(nf.Records) == 0 {
+		if useBaseline {
+			return HealthResult{}, fmt.Errorf("node %q has no heartbeats; cannot use --missed-since-seq=%d as baseline", nodeID, baselineSeq)
+		}
 		return HealthResult{NodeID: nodeID, Status: "notelemetry", Findings: []string{"无遥测"}}, nil
 	}
 
-	latest := nf.Records[0]
-	for _, r := range nf.Records[1:] {
-		if r.Seq > latest.Seq {
-			latest = r
+	records := nf.Records // ascending seq, unique
+	latest := records[len(records)-1]
+
+	if useBaseline {
+		if baselineSeq > latest.Seq {
+			return HealthResult{}, fmt.Errorf("--missed-since-seq=%d is newer than the latest heartbeat seq %d for node %q", baselineSeq, latest.Seq, nodeID)
 		}
 	}
 
@@ -358,29 +408,81 @@ func (s *Store) Health(nodeID string, at time.Time, expectedVersion string, tole
 	age := at.Sub(latest.CollectedAt)
 	online := age <= onlineWindow
 
-	node := Node{
-		ID:      nodeID,
-		Version: latest.Version,
-		Height:  latest.Height,
-		Missed:  int(latest.Missed),
-		Online:  online,
-	}
-	h := Evaluate(node, expectedVersion, toleratedMisses)
-
-	status := "online"
+	findings := []string{}
 	if !online {
-		status = "offline"
+		findings = append(findings, "offline")
 	}
-	return HealthResult{
+	if latest.Version != expectedVersion {
+		findings = append(findings, "version skew: "+latest.Version+" != "+expectedVersion)
+	}
+
+	result := HealthResult{
 		NodeID:      nodeID,
-		Status:      status,
+		Status:      "online",
 		Seq:         latest.Seq,
 		CollectedAt: latest.CollectedAt,
 		Version:     latest.Version,
 		Height:      latest.Height,
 		Missed:      latest.Missed,
-		Findings:    h.Findings,
-	}, nil
+	}
+	if !online {
+		result.Status = "offline"
+	}
+
+	if !useBaseline {
+		// Cumulative judgement: the current counter must strictly exceed the
+		// tolerance (mirrors Evaluate for callers that do not use a baseline).
+		node := Node{
+			ID:      nodeID,
+			Version: latest.Version,
+			Height:  latest.Height,
+			Missed:  int(latest.Missed),
+			Online:  online,
+		}
+		result.Findings = Evaluate(node, expectedVersion, toleratedMisses).Findings
+		return result, nil
+	}
+
+	baselineIdx := -1
+	for i, r := range records {
+		if r.Seq == baselineSeq {
+			baselineIdx = i
+			break
+		}
+	}
+	if baselineIdx < 0 {
+		return HealthResult{}, fmt.Errorf("no saved heartbeat with seq %d for node %q; cannot use it as --missed-since-seq baseline", baselineSeq, nodeID)
+	}
+	baseline := records[baselineIdx]
+	result.BaselineSeq = baseline.Seq
+	result.BaselineMissed = baseline.Missed
+
+	// Walk only saved records from the baseline up to the latest. Records are
+	// stored ascending by seq and seqs may legitimately have gaps, so any
+	// decrease between two adjacent saved records in this interval proves the
+	// cumulative counter reset somewhere in it; the endpoint difference alone
+	// must not be trusted even if the final count recovers.
+	rolledBack := false
+	for i := baselineIdx + 1; i < len(records); i++ {
+		if records[i].Missed < records[i-1].Missed {
+			rolledBack = true
+			break
+		}
+	}
+	if rolledBack {
+		result.NewMissedKnown = false
+		findings = append(findings, rollbackFinding)
+	} else {
+		result.NewMissedKnown = true
+		// No decrease was observed, so cumulative counts cannot have wrapped
+		// backwards within int64 range; the difference stays exact.
+		result.NewMissed = latest.Missed - baseline.Missed
+		if result.NewMissed > int64(toleratedMisses) {
+			findings = append(findings, "missed duties above tolerance")
+		}
+	}
+	result.Findings = findings
+	return result, nil
 }
 
 // History returns all heartbeats for a node in ascending seq order, without
