@@ -70,12 +70,73 @@ func TestParseHeartbeatsInvalid(t *testing.T) {
 		{"height negative", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":-1,"missed":0}]`},
 		{"missed negative", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":-1}]`},
 		{"record not object", `[42]`},
+		{"null node", `[{"node":null,"seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"null seq", `[{"node":"val-1","seq":null,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"null collected_at", `[{"node":"val-1","seq":1,"collected_at":null,"version":"1.0","height":1,"missed":0}]`},
+		{"null version", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":null,"height":1,"missed":0}]`},
+		{"null height", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0}]`},
+		{"null missed", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":null}]`},
+		{"duplicate field same value", `[{"node":"val-1","node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"duplicate field different value", `[{"node":"val-1","seq":1,"seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}]`},
+		{"duplicate field reordered", `[{"missed":0,"node":"val-1","height":1,"seq":1,"seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0"}]`},
+		{"duplicate field unicode escape", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"\u006d\u0069\u0073\u0073\u0065\u0064":0}]`},
+		{"unknown field unicode escape", `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0,"\u0065xtra":1}]`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseHeartbeats([]byte(tc.input), testBase)
 			if err == nil {
 				t.Errorf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestParseHeartbeatsEscapedSingleFieldAccepted(t *testing.T) {
+	// A legitimate field appearing exactly once is accepted even when its
+	// name is written with Unicode escapes (m = "m").
+	input := `[{"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","\u0068eight":100,"missed":0}]`
+	records, err := ParseHeartbeats([]byte(input), testBase)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(records) != 1 || records[0].Height != 100 {
+		t.Errorf("record mismatch: %+v", records)
+	}
+}
+
+func TestParseHeartbeatsLargeIntegers(t *testing.T) {
+	// Values beyond float64 exact-integer range must survive verbatim.
+	input := `[{"node":"val-1","seq":9007199254740993,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1234567890123456789,"missed":0}]`
+	records, err := ParseHeartbeats([]byte(input), testBase)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if records[0].Seq != 9007199254740993 || records[0].Height != 1234567890123456789 {
+		t.Errorf("large integers altered: seq=%d height=%d", records[0].Seq, records[0].Height)
+	}
+}
+
+func TestParseHeartbeatsRejectBatchAtomicity(t *testing.T) {
+	good := `{"node":"ok","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}`
+	nullBad := `{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":null,"missed":0}`
+	dupBad := `{"node":"bad","seq":1,"seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}`
+	for name, batch := range map[string]string{
+		"bad first":  `[` + nullBad + `,` + good + `]`,
+		"bad middle": `[` + good + `,` + nullBad + `,` + good + `]`,
+		"bad last":   `[` + good + `,` + nullBad + `]`,
+		"dup first":  `[` + dupBad + `,` + good + `]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseHeartbeats([]byte(batch), testBase)
+			if err == nil {
+				t.Fatalf("expected parse error")
+			}
+			// Error identifies 1-based position and a field name.
+			msg := err.Error()
+			if !strings.Contains(msg, "record ") ||
+				!(strings.Contains(msg, `"height"`) || strings.Contains(msg, `"seq"`)) {
+				t.Errorf("error missing position/field: %v", err)
 			}
 		})
 	}
@@ -880,7 +941,7 @@ func TestNodePathReversible(t *testing.T) {
 
 func TestValidateHeartbeatErrorMessage(t *testing.T) {
 	cases := []struct {
-		hb  Heartbeat
+		hb   Heartbeat
 		want string
 	}{
 		{hb("", 1, testBase, "1.0", 1, 0), "node"},

@@ -1,8 +1,10 @@
 package edgefleet
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -92,16 +94,58 @@ func ParseHeartbeats(data []byte, receiveTime time.Time) ([]Heartbeat, error) {
 }
 
 func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	// Parse the object token by token instead of via map[string]RawMessage:
+	// that map silently keeps the last value for a repeated key (and decodes
+	// \uXXXX escapes first), neither of which is acceptable here.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	tok, err := dec.Token()
+	if err != nil {
 		return Heartbeat{}, fmt.Errorf("record must be a JSON object: %w", err)
 	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return Heartbeat{}, fmt.Errorf("record must be a JSON object")
+	}
+
+	values := make(map[string]json.RawMessage, len(heartbeatFields))
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return Heartbeat{}, fmt.Errorf("invalid heartbeat object: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return Heartbeat{}, fmt.Errorf("invalid heartbeat object: field name must be a string")
+		}
+		// Field names are identified by their decoded JSON text, so "missed"
+		// written as "missed" names the same field and repeats it.
+		if _, seen := values[key]; seen {
+			return Heartbeat{}, fmt.Errorf("duplicate field %q in record", key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return Heartbeat{}, fmt.Errorf("invalid value for field %q: %w", key, err)
+		}
+		values[key] = value
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return Heartbeat{}, fmt.Errorf("invalid heartbeat object: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return Heartbeat{}, fmt.Errorf("invalid heartbeat object: trailing content after object")
+	}
+
 	for _, f := range heartbeatFields {
-		if _, ok := fields[f]; !ok {
+		v, ok := values[f]
+		if !ok {
 			return Heartbeat{}, fmt.Errorf("missing required field %q", f)
 		}
+		if isJSONNull(v) {
+			return Heartbeat{}, fmt.Errorf("field %q must not be null", f)
+		}
 	}
-	for k := range fields {
+	for k := range values {
 		if !containsString(heartbeatFields, k) {
 			return Heartbeat{}, fmt.Errorf("unknown field %q", k)
 		}
@@ -109,14 +153,14 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 
 	var h Heartbeat
 
-	if err := json.Unmarshal(fields["node"], &h.NodeID); err != nil {
+	if err := json.Unmarshal(values["node"], &h.NodeID); err != nil {
 		return Heartbeat{}, fmt.Errorf("node must be a string: %w", err)
 	}
 	if h.NodeID == "" {
 		return Heartbeat{}, fmt.Errorf("node must not be empty")
 	}
 
-	if err := json.Unmarshal(fields["seq"], &h.Seq); err != nil {
+	if err := decodeInt(values["seq"], &h.Seq); err != nil {
 		return Heartbeat{}, fmt.Errorf("seq must be an integer: %w", err)
 	}
 	if h.Seq <= 0 {
@@ -124,7 +168,7 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 	}
 
 	var collectedStr string
-	if err := json.Unmarshal(fields["collected_at"], &collectedStr); err != nil {
+	if err := json.Unmarshal(values["collected_at"], &collectedStr); err != nil {
 		return Heartbeat{}, fmt.Errorf("collected_at must be a string: %w", err)
 	}
 	t, err := time.Parse(time.RFC3339, collectedStr)
@@ -133,21 +177,21 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 	}
 	h.CollectedAt = t
 
-	if err := json.Unmarshal(fields["version"], &h.Version); err != nil {
+	if err := json.Unmarshal(values["version"], &h.Version); err != nil {
 		return Heartbeat{}, fmt.Errorf("version must be a string: %w", err)
 	}
 	if h.Version == "" {
 		return Heartbeat{}, fmt.Errorf("version must not be empty")
 	}
 
-	if err := json.Unmarshal(fields["height"], &h.Height); err != nil {
+	if err := decodeInt(values["height"], &h.Height); err != nil {
 		return Heartbeat{}, fmt.Errorf("height must be an integer: %w", err)
 	}
 	if h.Height < 0 {
 		return Heartbeat{}, fmt.Errorf("height must be >= 0, got %d", h.Height)
 	}
 
-	if err := json.Unmarshal(fields["missed"], &h.Missed); err != nil {
+	if err := decodeInt(values["missed"], &h.Missed); err != nil {
 		return Heartbeat{}, fmt.Errorf("missed must be an integer: %w", err)
 	}
 	if h.Missed < 0 {
@@ -159,6 +203,27 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
 	}
 	return h, nil
+}
+
+// isJSONNull reports whether a raw JSON value is exactly null.
+func isJSONNull(v json.RawMessage) bool {
+	return string(bytes.TrimSpace(v)) == "null"
+}
+
+// decodeInt decodes a JSON value into an int64, accepting only integer
+// numbers: floats, booleans, strings and null are rejected, as are values
+// outside the int64 range. A genuine 0 decodes to 0 like any other value.
+func decodeInt(raw json.RawMessage, dst *int64) error {
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return err
+	}
+	parsed, err := n.Int64()
+	if err != nil {
+		return fmt.Errorf("not an integer: %w", err)
+	}
+	*dst = parsed
+	return nil
 }
 
 func containsString(list []string, s string) bool {
