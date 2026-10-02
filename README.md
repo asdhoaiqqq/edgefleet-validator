@@ -14,10 +14,16 @@ printf '%s\n' \
   '{"type":"event","key":"sensor-a","time":1200,"value":5}' \
   '{"type":"watermark","time":2000}' \
   | go run ./cmd/edgefleet aggregate --window-ms 1000
+printf '%s\n' \
+  '{"type":"event","partition":0,"key":"sensor-a","time":1200,"value":5}' \
+  '{"type":"watermark","partition":1,"time":2000}' \
+  | go run ./cmd/edgefleet aggregate --window-ms 1000 --partitions 2
 go test ./...
 ```
 
 `aggregate` 从标准输入读取逐行 JSON 事件与水位线记录，按事件时间汇总固定长度窗口（左闭右开，从时间零开始），只在输入水位线推进时输出 end ≤ 水位线的窗口；完全离线，不使用当前时间。详见 `go run ./cmd/edgefleet help`。
+
+可选的 `--partitions N`（N 为正的有符号 64 位整数）声明输入合并自 N 个独立分区，此时每条 event/watermark 记录都必须带取值 `[0,N)` 的整数 `partition` 字段。各分区水位线独立推进：所有分区至少各报一次水位线之前不存在有效整体水位线，之后整体水位线取各分区当前值的最小值，窗口关闭与迟到判定都使用该最小值；分区水位线允许重复或向前跳跃，倒退即报错。相同 key、相同窗口的事件无论来自哪个分区都合并为同一个 count/sum，输出不含分区字段。未指定 `--partitions` 时保持单水位线行为（包括忽略额外字段）。
 
 ## 技术方向
 
