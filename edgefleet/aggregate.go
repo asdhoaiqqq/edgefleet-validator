@@ -31,6 +31,46 @@ func (e *InputError) Error() string {
 	return fmt.Sprintf("line %d: %s", e.Line, e.Reason)
 }
 
+// OutputError reports that output triggered by one physical input line could
+// not be written in full. Line is that input line (blank lines count), and
+// Kind is either "window result" or "late-event notice". Detail identifies
+// the record: a window's key and [start,end), or the skipped event time and
+// the watermark used to judge it. Err is the writer's own error, including
+// when only a prefix was accepted before it failed; when the writer reported
+// no error but accepted too few bytes, Err is io.ErrShortWrite. Use
+// errors.Is to inspect it. Content the writer already accepted stays in
+// place and fully written earlier results stay valid.
+type OutputError struct {
+	Line   int
+	Kind   string
+	Detail string
+	Err    error
+}
+
+func (e *OutputError) Error() string {
+	return fmt.Sprintf("line %d: %s not fully written (%s): %v", e.Line, e.Kind, e.Detail, e.Err)
+}
+
+func (e *OutputError) Unwrap() error {
+	return e.Err
+}
+
+// writeFull writes all of p to w in one call. Any writer error is returned
+// unchanged, even when the writer accepted a prefix first, so callers keep
+// errors.Is access to the original error. A nil error with fewer than
+// len(p) accepted bytes is reported as io.ErrShortWrite; writeFull never
+// retries or resends the missing tail.
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n < len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 type windowID struct {
 	start int64 // inclusive window start in milliseconds since time zero
 	key   string
@@ -49,9 +89,21 @@ type windowState struct {
 // solely by input watermarks: a window whose end is less than or equal to the
 // current watermark is emitted once, ordered by end ascending and then by key
 // in UTF-8 byte order. Late events (event time below the current watermark)
-// are reported on lateLog with their physical line number and skipped. Fatal
-// record problems return *InputError; results already written to out stay
-// written, and open windows are not flushed at end of input.
+// are reported on lateLog with their physical line number and skipped. Every
+// output must land in full: a window result is its complete JSON object plus
+// trailing newline and a late-event notice is its complete single line. If
+// the corresponding writer returns an error after accepting zero bytes or
+// only a prefix, or accepts too few bytes with no error, the run fails at
+// once with *OutputError naming the triggering physical input line:
+// window-result failures identify the key and window [start,end), and
+// late-notice failures identify the skipped event time and the watermark
+// used; a nil-error short write is io.ErrShortWrite and errors.Is exposes
+// the writer's original error. After such a failure no further records are
+// processed, the failed content is neither rewritten nor resent, and
+// still-open windows produce no further results; content already accepted
+// by the writers stays in place, including fully written earlier results.
+// Fatal record problems return *InputError; results already written to out
+// stay written, and open windows are not flushed at end of input.
 //
 // This is the legacy single-watermark mode: records carry no partition field
 // and any extra fields are ignored. Use RunAggregatePartitioned to merge
@@ -289,7 +341,15 @@ func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int
 	}
 
 	if s.watermark != nil && eventTime < *s.watermark {
-		fmt.Fprintf(s.lateLog, "line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *s.watermark)
+		notice := fmt.Sprintf("line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *s.watermark)
+		if err := writeFull(s.lateLog, []byte(notice)); err != nil {
+			return &OutputError{
+				Line:   lineNo,
+				Kind:   "late-event notice",
+				Detail: fmt.Sprintf("event time %d below current watermark %d", eventTime, *s.watermark),
+				Err:    err,
+			}
+		}
 		return nil
 	}
 
@@ -368,7 +428,7 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 	if s.watermark == nil {
 		return nil
 	}
-	return s.closeWindows(*s.watermark)
+	return s.closeWindows(*s.watermark, lineNo)
 }
 
 // processIdle declares a partition idle: it stops contributing to the
@@ -394,7 +454,7 @@ func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int)
 	if s.watermark == nil {
 		return nil
 	}
-	return s.closeWindows(*s.watermark)
+	return s.closeWindows(*s.watermark, lineNo)
 }
 
 // effectiveWatermark returns the minimum watermark over the non-idle
@@ -440,7 +500,7 @@ func (s *aggregateState) requiredPartition(obj map[string]json.RawMessage, lineN
 	return p, nil
 }
 
-func (s *aggregateState) closeWindows(watermark int64) error {
+func (s *aggregateState) closeWindows(watermark int64, lineNo int) error {
 	type pending struct {
 		id windowID
 		st *windowState
@@ -468,8 +528,19 @@ func (s *aggregateState) closeWindows(watermark int64) error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.out.Write(append(encoded, '\n')); err != nil {
-			return err
+		line := append(encoded, '\n')
+		if err := writeFull(s.out, line); err != nil {
+			// Stop immediately: the writer may hold zero bytes or only a
+			// prefix of this record, but a truncated record is not a fully
+			// output one, so the window stays open in the map. Do not retry
+			// or resend it and do not emit the remaining ready windows;
+			// content already accepted by the writer stays.
+			return &OutputError{
+				Line:   lineNo,
+				Kind:   "window result",
+				Detail: fmt.Sprintf("key %q window [%d,%d)", p.id.key, p.id.start, p.st.end),
+				Err:    err,
+			}
 		}
 		delete(s.windows, p.id)
 	}
