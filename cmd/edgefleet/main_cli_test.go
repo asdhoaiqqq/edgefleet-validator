@@ -20,6 +20,8 @@ package main
 // involved.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -367,4 +369,185 @@ func TestCLIHealthBaselineOnNodeWithoutTelemetryFails(t *testing.T) {
 	if strings.Contains(out, "baseline_seq") {
 		t.Errorf("notelemetry output must not mention a baseline: %q", out)
 	}
+}
+
+// nodeFileHexPath mirrors the per-node file naming used by the store.
+func nodeFileHexPath(dir, node string) string {
+	return filepath.Join(dir, "nodes", hex.EncodeToString([]byte(node))+".json")
+}
+
+// corruptNodeFile overwrites one node's saved file with raw content.
+func corruptNodeFile(t *testing.T, dir, node, content string) {
+	t.Helper()
+	if err := os.WriteFile(nodeFileHexPath(dir, node), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readNodeFile returns the current raw bytes of a node's file.
+func readNodeFile(t *testing.T, dir, node string) string {
+	t.Helper()
+	b, err := os.ReadFile(nodeFileHexPath(dir, node))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// strictChecksum replicates the store's checksum over the canonical JSON of a
+// single record slice, so a test can forge a checksum matching a tampered
+// interpretation. canonicalJSON must be the store's marshaled record form.
+func strictChecksum(canonicalJSON string) string {
+	sum := sha256.Sum256([]byte(canonicalJSON))
+	return hex.EncodeToString(sum[:])
+}
+
+// envelope wraps a raw records array in a well-formed store file.
+func envelope(checksum, recordsJSON string) string {
+	return `{"format":"edgefleet-heartbeats-v1","checksum":"` + checksum + `","records":` + recordsJSON + `}`
+}
+
+// TestCLIStoredCorruptionRefusedByQueries exercises the user-visible contract:
+// a saved record with a missing, null or duplicated telemetry field corrupts
+// the node's data even when the checksum matches the interpreted values; every
+// query for that node fails on stderr with a non-zero exit and prints nothing
+// on stdout, while other nodes keep working.
+func TestCLIStoredCorruptionRefusedByQueries(t *testing.T) {
+	f := newFixture(t)
+
+	const badRecord = `{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100,"missed":0}`
+	submitBatch(t, f.dir, "["+badRecord+"]")
+
+	cases := []struct {
+		name        string
+		tamper      string // raw records array stored alongside a matching checksum
+		interpreted string // canonical records a lenient reader reconstructs
+		wantField   string
+	}{
+		{
+			name:        "missing missed stays matching with original checksum",
+			tamper:      `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100}]`,
+			interpreted: `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100,"missed":0}]`,
+			wantField:   "missed",
+		},
+		{
+			name:        "null height with checksum over zero-filled value",
+			tamper:      `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":null,"missed":0}]`,
+			interpreted: `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":0,"missed":0}]`,
+			wantField:   "height",
+		},
+		{
+			name:        "duplicate missed same value, last-wins interpretation matches",
+			tamper:      `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100,"missed":0,"missed":0}]`,
+			interpreted: `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100,"missed":0}]`,
+			wantField:   "missed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The forged checksum hashes the canonical record a lenient
+			// reader would reconstruct (zero-filled / last value).
+			corruptNodeFile(t, f.dir, "bad", envelope(strictChecksum(tc.interpreted), tc.tamper))
+
+			// history: non-zero exit, explicit reason on stderr naming the
+			// file/record/field, no normal output on stdout.
+			out, errOut, code := runCLI(t, f.dir, "",
+				"heartbeat", "history", "--data-dir", f.dir, "--node", "bad")
+			if code == 0 {
+				t.Errorf("history on corrupt node must exit non-zero; stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("history must print no results on corruption, stdout=%q", out)
+			}
+			if !strings.Contains(errOut, "error:") || !strings.Contains(errOut, "record 1") ||
+				!strings.Contains(errOut, tc.wantField) {
+				t.Errorf("history stderr must explain the corrupt record/field, got %q", errOut)
+			}
+			if !strings.Contains(errOut, filepath.Base(nodeFileHexPath(f.dir, "bad"))) {
+				t.Errorf("history stderr should identify the corrupt file, got %q", errOut)
+			}
+
+			// health: same contract.
+			out, errOut, code = health(t, f,
+				"--node", "bad", "--expected-version", "1.26.0", "--tolerated-misses", "0")
+			if code == 0 {
+				t.Errorf("health on corrupt node must exit non-zero; stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("health must print no results on corruption, stdout=%q", out)
+			}
+			if !strings.Contains(errOut, "record 1") || !strings.Contains(errOut, tc.wantField) {
+				t.Errorf("health stderr must explain the corrupt record/field, got %q", errOut)
+			}
+
+			// health with a missed-duty baseline must fail identically rather
+			// than skipping the bad record.
+			out, errOut, code = health(t, f,
+				"--node", "bad", "--expected-version", "1.26.0",
+				"--tolerated-misses", "0", "--missed-since-seq", "1")
+			if code == 0 {
+				t.Errorf("baseline health on corrupt node must exit non-zero; stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("baseline health must print no results on corruption, stdout=%q", out)
+			}
+			if !strings.Contains(errOut, tc.wantField) {
+				t.Errorf("baseline health stderr must name the field, got %q", errOut)
+			}
+		})
+	}
+}
+
+// TestCLISubmitRejectsBatchTouchingCorruptNode ensures a batch is refused
+// before any new record is saved: the corrupt file stays byte-for-byte
+// intact, other files in the batch are not written, and no new node file is
+// created. Submitting only to healthy nodes continues to work.
+func TestCLISubmitRejectsBatchTouchingCorruptNode(t *testing.T) {
+	f := newFixture(t)
+
+	const canonical = `[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100,"missed":0}]`
+	submitBatch(t, f.dir, "["+strings.Trim(canonical, "[]")+"]")
+	// Delete "missed" from the genuine record (its value was 0); keep the
+	// original checksum, which still matches the zero-filled interpretation.
+	corruptNodeFile(t, f.dir, "bad", envelope(strictChecksum(canonical),
+		`[{"node":"bad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":100}]`))
+
+	badBefore := readNodeFile(t, f.dir, "bad")
+	monoBefore := readNodeFile(t, f.dir, "mono")
+
+	batch := `[
+	  {"node":"bad","seq":2,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":102,"missed":0},
+	  {"node":"mono","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":104,"missed":15},
+	  {"node":"brandnew","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}
+	]`
+	out, errOut, code := runCLI(t, f.dir, batch,
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+	if code == 0 {
+		t.Errorf("submit touching a corrupt node must fail non-zero; stdout=%q stderr=%q", out, errOut)
+	}
+	if strings.Contains(out, "submitted") {
+		t.Errorf("rejected batch must not report success, stdout=%q", out)
+	}
+	if !strings.Contains(errOut, "corruption") || !strings.Contains(errOut, "missed") {
+		t.Errorf("submit stderr must explain the corruption, got %q", errOut)
+	}
+
+	if got := readNodeFile(t, f.dir, "bad"); got != badBefore {
+		t.Errorf("corrupt node file was modified during rejected submit")
+	}
+	if got := readNodeFile(t, f.dir, "mono"); got != monoBefore {
+		t.Errorf("healthy node file was rewritten during rejected submit")
+	}
+	if _, err := os.Stat(nodeFileHexPath(f.dir, "brandnew")); !os.IsNotExist(err) {
+		t.Errorf("brand-new node file must not be created, stat err=%v", err)
+	}
+
+	// Healthy nodes are unaffected and remain fully usable.
+	out, _, code = health(t, f,
+		"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "9")
+	if code != 0 || !strings.Contains(out, "node=mono") {
+		t.Errorf("healthy node must still query normally: code=%d out=%q", code, out)
+	}
+	submitBatch(t, f.dir, `[{"node":"gappy","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":304,"missed":4}]`)
 }

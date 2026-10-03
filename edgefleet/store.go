@@ -1,11 +1,13 @@
 package edgefleet
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -110,6 +112,12 @@ func checksumRecords(records []Heartbeat) string {
 // loadNodeFile reads and verifies the file for one node. A missing file means
 // the node has no records (returns nil, nil). Any parse, checksum or
 // structural failure is reported as a CorruptError.
+//
+// The file is decoded with the same strict rules as submit input: every
+// telemetry field must be present, non-null and written once per record. A
+// checksum that matches the zero-filled interpretation of a tampered record
+// therefore cannot make a missing value look like real telemetry — the
+// record is rejected before the checksum is consulted.
 func loadNodeFile(path string) (*nodeFile, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -118,15 +126,12 @@ func loadNodeFile(path string) (*nodeFile, error) {
 	if err != nil {
 		return nil, &CorruptError{Path: path, Err: err}
 	}
-	var nf nodeFile
-	if err := json.Unmarshal(data, &nf); err != nil {
-		return nil, &CorruptError{Path: path, Err: fmt.Errorf("invalid JSON: %w", err)}
+	nf, err := decodeStrictNodeFile(data)
+	if err != nil {
+		return nil, &CorruptError{Path: path, Err: err}
 	}
 	if nf.Format != formatMarker {
 		return nil, &CorruptError{Path: path, Err: fmt.Errorf("unknown format marker %q", nf.Format)}
-	}
-	if nf.Records == nil {
-		nf.Records = []Heartbeat{}
 	}
 	if err := validateStoredRecords(nf.Records); err != nil {
 		return nil, &CorruptError{Path: path, Err: err}
@@ -134,33 +139,145 @@ func loadNodeFile(path string) (*nodeFile, error) {
 	if got := checksumRecords(nf.Records); got != nf.Checksum {
 		return nil, &CorruptError{Path: path, Err: fmt.Errorf("checksum mismatch: stored %s, computed %s", nf.Checksum, got)}
 	}
-	return &nf, nil
+	return nf, nil
 }
 
-// validateStoredRecords checks the structural invariants of a stored record
-// set: sorted by ascending seq, no duplicate seq, valid field values.
+// decodeStrictNodeFile parses the on-disk envelope without letting
+// encoding/json defaults hide missing or duplicated data. The envelope has
+// exactly three keys — format, checksum, records — each present, non-null and
+// written once (a Unicode-escaped spelling of the same key still collides),
+// and no other keys. Every element of records is decoded with
+// decodeStrictHeartbeatObject, so a missing, null or duplicated telemetry
+// field is an error naming the record and field rather than a zero value.
+// Whitespace and key ordering carry no meaning and never cause a failure.
+func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("invalid JSON: file must be a JSON object")
+	}
+
+	var (
+		format   string
+		checksum string
+		records  []json.RawMessage
+
+		seenFormat   bool
+		seenChecksum bool
+		seenRecords  bool
+	)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("invalid JSON: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid JSON: envelope field name must be a string")
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil, fmt.Errorf("invalid value for envelope field %q: %w", key, err)
+		}
+		switch key {
+		case "format":
+			if seenFormat {
+				return nil, fmt.Errorf("duplicate envelope field %q", key)
+			}
+			seenFormat = true
+			if bytes.Equal(val, []byte("null")) {
+				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			}
+			if err := json.Unmarshal(val, &format); err != nil {
+				return nil, fmt.Errorf("format must be a string: %w", err)
+			}
+		case "checksum":
+			if seenChecksum {
+				return nil, fmt.Errorf("duplicate envelope field %q", key)
+			}
+			seenChecksum = true
+			if bytes.Equal(val, []byte("null")) {
+				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			}
+			if err := json.Unmarshal(val, &checksum); err != nil {
+				return nil, fmt.Errorf("checksum must be a string: %w", err)
+			}
+		case "records":
+			if seenRecords {
+				return nil, fmt.Errorf("duplicate envelope field %q", key)
+			}
+			seenRecords = true
+			if bytes.Equal(val, []byte("null")) {
+				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			}
+			if err := json.Unmarshal(val, &records); err != nil {
+				return nil, fmt.Errorf("records must be an array of heartbeat objects: %w", err)
+			}
+		default:
+			return nil, fmt.Errorf("unknown envelope field %q", key)
+		}
+	}
+	// Consume the closing brace.
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	// Nothing may follow the single envelope object.
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("invalid JSON: unexpected data after the envelope object")
+		}
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	if !seenFormat {
+		return nil, fmt.Errorf("missing required envelope field %q", "format")
+	}
+	if !seenChecksum {
+		return nil, fmt.Errorf("missing required envelope field %q", "checksum")
+	}
+	if !seenRecords {
+		return nil, fmt.Errorf("missing required envelope field %q", "records")
+	}
+
+	nf := &nodeFile{Format: format, Checksum: checksum, Records: make([]Heartbeat, 0, len(records))}
+	for i, raw := range records {
+		h, err := decodeStrictHeartbeatObject(raw)
+		if err != nil {
+			return nil, fmt.Errorf("record %d: %w", i+1, err)
+		}
+		nf.Records = append(nf.Records, h)
+	}
+	return nf, nil
+}
+
+// validateStoredRecords checks the structural invariants of a strictly
+// decoded record set: sorted by ascending seq with no duplicate seq and
+// valid field values. Position numbers are 1-based to match decoder errors.
 func validateStoredRecords(records []Heartbeat) error {
 	for i, r := range records {
 		if r.NodeID == "" {
-			return fmt.Errorf("record %d: empty node id", i)
+			return fmt.Errorf("record %d: field %q must not be empty", i+1, "node")
 		}
 		if r.Seq <= 0 {
-			return fmt.Errorf("record %d: seq must be a positive integer, got %d", i, r.Seq)
+			return fmt.Errorf("record %d: field %q must be a positive integer, got %d", i+1, "seq", r.Seq)
 		}
 		if r.Version == "" {
-			return fmt.Errorf("record %d: empty version", i)
+			return fmt.Errorf("record %d: field %q must not be empty", i+1, "version")
 		}
 		if r.Height < 0 {
-			return fmt.Errorf("record %d: negative height %d", i, r.Height)
+			return fmt.Errorf("record %d: field %q must be >= 0, got %d", i+1, "height", r.Height)
 		}
 		if r.Missed < 0 {
-			return fmt.Errorf("record %d: negative missed %d", i, r.Missed)
+			return fmt.Errorf("record %d: field %q must be >= 0, got %d", i+1, "missed", r.Missed)
 		}
 		if r.CollectedAt.IsZero() {
-			return fmt.Errorf("record %d: missing collected_at", i)
+			return fmt.Errorf("record %d: field %q is missing or invalid", i+1, "collected_at")
 		}
 		if i > 0 && records[i-1].Seq >= r.Seq {
-			return fmt.Errorf("records not sorted by ascending seq at position %d", i)
+			return fmt.Errorf("records not sorted by ascending seq at record %d", i+1)
 		}
 	}
 	return nil

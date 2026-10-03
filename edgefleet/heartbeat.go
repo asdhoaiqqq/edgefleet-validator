@@ -102,7 +102,15 @@ func rejectNull(raw json.RawMessage, field string) error {
 	return nil
 }
 
-func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
+// decodeStrictHeartbeatObject converts one JSON object's raw bytes into a
+// Heartbeat while enforcing the field rules at every trust boundary: all
+// fields must be present and non-null, unknown fields are rejected, and a
+// field may never appear twice in the same object — even with the same
+// value, and even when one spelling uses a JSON Unicode escape denoting the
+// same key. A plain struct/map unmarshal would instead keep the last
+// occurrence and let an absent field masquerade as the zero value. Both the
+// submit input path and the stored-file read path must use it.
+func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	// Walk the object with a streaming decoder so duplicate field names are
 	// detected. Field names are compared as the JSON string they represent:
 	// "missed" and "m\u0069ssed" are the same field. A map-based unmarshal
@@ -216,6 +224,16 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("missed must be >= 0, got %d", h.Missed)
 	}
 
+	return h, nil
+}
+
+// parseOneHeartbeat decodes one submit-input record and applies the
+// submit-only rule that collection time cannot be later than receive time.
+func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
+	h, err := decodeStrictHeartbeatObject(raw)
+	if err != nil {
+		return Heartbeat{}, err
+	}
 	if h.CollectedAt.After(receiveTime) {
 		return Heartbeat{}, fmt.Errorf("collected_at %s is later than receive time %s",
 			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
