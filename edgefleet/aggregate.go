@@ -1,9 +1,9 @@
 package edgefleet
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -105,6 +105,18 @@ type windowState struct {
 // Fatal record problems return *InputError; results already written to out
 // stay written, and open windows are not flushed at end of input.
 //
+// A read failure is distinct from reaching the end of input. At clean
+// io.EOF a final record that arrived without a trailing newline is still
+// processed (and a damaged one is an *InputError carrying its physical line
+// number). When r returns any other error after delivering bytes, only
+// records whose newline was already received are processed, in order,
+// including records returned by the same Read that carried the error; the
+// remaining unterminated bytes never become an event, watermark or idle
+// declaration and can produce no late notice or window result, and the
+// reader's own error is then returned unchanged so errors.Is exposes it. A
+// record or output failure on one of those complete lines is reported
+// instead of the read error discovered afterwards.
+//
 // This is the legacy single-watermark mode: records carry no partition field
 // and any extra fields are ignored. Use RunAggregatePartitioned to merge
 // several independent input sources of the same stream, or
@@ -196,20 +208,127 @@ func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, part
 		idle:          make(map[int64]bool),
 	}
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024*1024)
+	// Read records with a line collector that keeps a read failure distinct
+	// from end of input: only newline-terminated lines (plus, at a clean EOF,
+	// one unterminated final line) ever become records.
 	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSuffix(scanner.Text(), "\r")
+	err := readAggregateLines(r, func(line string, no int) error {
+		lineNo = no
 		if strings.TrimSpace(line) == "" {
-			continue
+			return nil
 		}
-		if err := s.processLine(line, lineNo); err != nil {
-			return err
+		return s.processLine(line, lineNo)
+	})
+	return err
+}
+
+// maxAggregateLineBytes caps the size of a single physical input line, matching
+// the scanner buffer limit this used to run with. A line this long is fatal
+// before its record is parsed.
+const maxAggregateLineBytes = 1024 * 1024 * 1024
+
+// errAggregateLineTooLong reports a physical input line that never ends within
+// maxAggregateLineBytes.
+var errAggregateLineTooLong = errors.New("aggregate input line longer than 1 GiB")
+
+// errAggregateBadReadCount reports an io.Reader that handed back a byte count
+// outside the destination buffer, violating the io.Reader contract.
+var errAggregateBadReadCount = errors.New("aggregate reader returned an impossible byte count")
+
+// readAggregateLines feeds newline-delimited physical lines from r to handle,
+// counting every line (a bare "\n" is a blank line too) and stripping a single
+// trailing '\r' so CRLF input works as before. Clean end of input and a
+// non-EOF read failure are handled differently: at clean io.EOF a final line
+// missing its newline is still delivered, exactly like every other final
+// record; after a non-EOF read error only lines whose newline was already
+// received (including those delivered by the same Read that carried the
+// error) are handled, in order, and then the reader's original error is
+// returned. The unterminated tail never reaches handle, so a read failure
+// mid-record can neither be misreported as an input error nor produce
+// events, watermarks, idle declarations, late notices or window results. A
+// non-nil error from handle stops reading immediately and replaces the read
+// error, so an earlier record or output failure is not overwritten by a
+// failure the reader only reports later.
+func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error) error {
+	// buf[start:end] is the undelivered tail; buf[:start] is space freed by
+	// already delivered lines. The buffer is compacted and grown like
+	// bufio.Scanner's, so a long unterminated line is bounded by
+	// maxAggregateLineBytes instead of growing without limit.
+	buf := make([]byte, 64*1024)
+	start, end := 0, 0
+	lineNo := 0
+	emptyReads := 0
+	deliver := func(b []byte) error {
+		lineNo++
+		line := strings.TrimSuffix(string(b), "\r")
+		return handle(line, lineNo)
+	}
+	for {
+		// Move the pending tail to the front when its freed prefix is large
+		// enough or when the whole buffer is pending.
+		if start > 0 && (end == len(buf) || start > len(buf)/2) {
+			copy(buf, buf[start:end])
+			end -= start
+			start = 0
+		}
+		if end == len(buf) {
+			// No newline fit before the end: the physical line is too long.
+			if len(buf) >= maxAggregateLineBytes {
+				return errAggregateLineTooLong
+			}
+			newLen := len(buf) * 2
+			if newLen > maxAggregateLineBytes || newLen < len(buf) {
+				newLen = maxAggregateLineBytes
+			}
+			grown := make([]byte, newLen)
+			copy(grown, buf[start:end])
+			buf = grown
+			end -= start
+			start = 0
+		}
+		n, readErr := r.Read(buf[end:])
+		if n < 0 || n > len(buf)-end {
+			// A Reader must never report a byte count outside the buffer.
+			return errAggregateBadReadCount
+		}
+		end += n
+		for {
+			i := bytes.IndexByte(buf[start:end], '\n')
+			if i < 0 {
+				break
+			}
+			if err := deliver(buf[start : start+i]); err != nil {
+				return err
+			}
+			start += i + 1
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				// Clean end of input: a trailing line without a newline is a
+				// complete final record; an empty tail (input ending exactly
+				// on '\n') is nothing, not an extra blank line.
+				if end > start {
+					if err := deliver(buf[start:end]); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			// Any other failure means the stream stopped mid-record: the
+			// still-unterminated bytes are not a record. Surface the original
+			// error unchanged so errors.Is keeps working for callers.
+			return readErr
+		}
+		if n == 0 {
+			// No data and no error: refuse to spin forever on a broken Reader.
+			emptyReads++
+			if emptyReads > 100 {
+				return io.ErrNoProgress
+			}
+		} else {
+			emptyReads = 0
 		}
 	}
-	return scanner.Err()
 }
 
 type aggregateState struct {

@@ -133,7 +133,13 @@ func usage() {
 	fmt.Println("  input line number, the affected key and window or the skipped event")
 	fmt.Println("  time and watermark, and the writer's error; the failed content is not")
 	fmt.Println("  resent, no further windows are emitted and content already written is")
-	fmt.Println("  retained. Standard output contains window results only.")
+	fmt.Println("  retained. Standard output contains window results only. A failure while")
+	fmt.Println("  reading standard input is likewise fatal: records whose newline was")
+	fmt.Println("  received, including those carried by the failing read, are processed in")
+	fmt.Println("  order first, but the unterminated trailing bytes never become a record,")
+	fmt.Println("  and the reader's error is reported here with a non-zero exit; clean end")
+	fmt.Println("  of input is not a read failure, so a final record without a trailing")
+	fmt.Println("  newline is still processed.")
 }
 
 func runAggregate(args []string) int {
