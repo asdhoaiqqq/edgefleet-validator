@@ -484,6 +484,97 @@ func TestChunkedArrivalReadErrorAfterCompleteRecordsPropagates(t *testing.T) {
 	})
 }
 
+// TestChunkedArrivalReadErrorDiscardsUnterminatedTail: a read failure in the
+// middle of a record is not end of input. The bytes received for that record
+// never got their newline, so they must not be parsed as a complete line:
+// no event, watermark or idle declaration comes out of them, no window closes
+// and no late notice is written, however well-formed the fragment happens to
+// be. Complete records already received are still processed first, and the
+// run then fails with the reader's original error.
+func TestChunkedArrivalReadErrorDiscardsUnterminatedTail(t *testing.T) {
+	eventLine := `{"type":"event","key":"k","time":100,"value":2}` + "\n"
+	watermarkLine := `{"type":"watermark","time":1000}` // closes [0,1000) once complete
+	wantWindow := `{"key":"k","start":0,"end":1000,"count":1,"sum":2}` + "\n"
+
+	t.Run("parseable tail without newline produces no window", func(t *testing.T) {
+		// The full watermark JSON arrived but its newline did not, then the
+		// reader failed: the watermark never completed, so [0,1000) stays open.
+		full := eventLine + watermarkLine
+		for _, shape := range []struct {
+			name string
+			r    *failingAfterReader
+		}{
+			{"error on the boundary read", &failingAfterReader{data: []byte(full), failAt: len(full), err: errSentinelChunkedRead, errOnBoundary: true}},
+			{"error on the next read", &failingAfterReader{data: []byte(full), failAt: len(full), err: errSentinelChunkedRead}},
+			{"one byte per read", &failingAfterReader{data: []byte(full), failAt: len(full), err: errSentinelChunkedRead, chunk: 1, errOnBoundary: true}},
+		} {
+			t.Run(shape.name, func(t *testing.T) {
+				var out, late bytes.Buffer
+				err := RunAggregate(shape.r, 1000, &out, &late)
+				if !errors.Is(err, errSentinelChunkedRead) {
+					t.Fatalf("error must be the reader's original error, got %T: %v", err, err)
+				}
+				if ie, ok := err.(*InputError); ok {
+					t.Fatalf("the unterminated tail must not be parsed as a record: %v", ie)
+				}
+				if out.String() != "" {
+					t.Fatalf("the incomplete watermark must not close [0,1000):\n got: %q\nwant: %q", out.String(), "")
+				}
+				if late.String() != "" {
+					t.Fatalf("no late notice may come from the incomplete record, got %q", late.String())
+				}
+			})
+		}
+	})
+
+	t.Run("newline completed before the error closes the window", func(t *testing.T) {
+		// The watermark's newline arrived in the same read that reported the
+		// failure: the record is complete, so [0,1000) closes with count 1,
+		// sum 2 before the read failure is returned.
+		full := eventLine + watermarkLine + "\n"
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{data: []byte(full), failAt: len(full), err: errSentinelChunkedRead, errOnBoundary: true}, 1000, &out, &late)
+		if !errors.Is(err, errSentinelChunkedRead) {
+			t.Fatalf("error must be the reader's original error, got %T: %v", err, err)
+		}
+		if out.String() != wantWindow {
+			t.Fatalf("the completed watermark must close [0,1000) before failing:\n got: %q\nwant: %q", out.String(), wantWindow)
+		}
+	})
+
+	t.Run("broken tail does not mask the read error", func(t *testing.T) {
+		// The fragment is not even valid JSON; the read failure, not a JSON
+		// input error, is the outcome.
+		broken := eventLine + `{"type":"watermark","time":1000`
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{data: []byte(broken), failAt: len(broken), err: errSentinelChunkedRead, errOnBoundary: true}, 1000, &out, &late)
+		if !errors.Is(err, errSentinelChunkedRead) {
+			t.Fatalf("error must be the reader's original error, got %T: %v", err, err)
+		}
+		if ie, ok := err.(*InputError); ok {
+			t.Fatalf("the broken tail must not be reported as an *InputError: %v", ie)
+		}
+		if out.String() != "" {
+			t.Fatalf("no window output may come from the broken tail, got %q", out.String())
+		}
+	})
+
+	t.Run("earlier record error wins over the read failure", func(t *testing.T) {
+		// Line 2 is complete and invalid; its input error happened before the
+		// read failure was known and stays the result.
+		bad := eventLine + "not json\n" + watermarkLine
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{data: []byte(bad), failAt: len(bad), err: errSentinelChunkedRead, errOnBoundary: true}, 1000, &out, &late)
+		var ie *InputError
+		if !errors.As(err, &ie) {
+			t.Fatalf("the earlier record error must be kept, got %T: %v", err, err)
+		}
+		if ie.Line != 2 {
+			t.Fatalf("InputError.Line = %d, want physical line 2", ie.Line)
+		}
+	})
+}
+
 // TestChunkedArrivalDiscriminatesCorrectAggregates ensures the invariant tests
 // above would actually fail on the regressions they target: missed counts,
 // double counting, and a late event admitted into the still-open overlap

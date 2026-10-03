@@ -1,9 +1,9 @@
 package edgefleet
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -105,6 +105,16 @@ type windowState struct {
 // Fatal record problems return *InputError; results already written to out
 // stay written, and open windows are not flushed at end of input.
 //
+// A clean end of input (EOF) treats bytes not terminated by a newline as the
+// final record. A read failure is not end of input: when the underlying
+// reader returns a non-EOF error, only complete newline-terminated records
+// received so far are processed — including records delivered by the same
+// read that reported the error — and the unterminated tail is discarded
+// instead of being parsed as a record, so it cannot produce events, window
+// results or late-event notices. The run then fails at once with the
+// reader's original error, which errors.Is can identify; a record or output
+// failure on an earlier complete line still takes precedence over it.
+//
 // This is the legacy single-watermark mode: records carry no partition field
 // and any extra fields are ignored. Use RunAggregatePartitioned to merge
 // several independent input sources of the same stream, or
@@ -196,20 +206,56 @@ func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, part
 		idle:          make(map[int64]bool),
 	}
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024*1024)
 	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSuffix(scanner.Text(), "\r")
-		if strings.TrimSpace(line) == "" {
+	var pending []byte // bytes received but not yet terminated by a newline
+	chunk := make([]byte, 64*1024)
+	for {
+		n, readErr := r.Read(chunk)
+		pending = append(pending, chunk[:n]...)
+
+		// Every newline-terminated record received so far is complete and is
+		// processed in arrival order, including records delivered by the same
+		// read that also reported an error. A record or output failure here
+		// happened before the read failure was known and stays the result.
+		for {
+			i := bytes.IndexByte(pending, '\n')
+			if i < 0 {
+				break
+			}
+			line := strings.TrimSuffix(string(pending[:i]), "\r")
+			pending = pending[i+1:]
+			lineNo++
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			if err := s.processLine(line, lineNo); err != nil {
+				return err
+			}
+		}
+
+		if readErr == nil {
 			continue
 		}
-		if err := s.processLine(line, lineNo); err != nil {
-			return err
+		if errors.Is(readErr, io.EOF) {
+			// Clean end of input: bytes not terminated by a newline are the
+			// final record and are processed as usual.
+			if len(pending) > 0 {
+				lineNo++
+				line := strings.TrimSuffix(string(pending), "\r")
+				if strings.TrimSpace(line) != "" {
+					if err := s.processLine(line, lineNo); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		}
+		// A read failure is not end of input: the unterminated tail may be
+		// only a fragment of a record, so it must not become an event,
+		// watermark or idle declaration. It is discarded, and the run fails
+		// with the reader's original error (unwrapped by errors.Is).
+		return fmt.Errorf("reading input: %w", readErr)
 	}
-	return scanner.Err()
 }
 
 type aggregateState struct {
