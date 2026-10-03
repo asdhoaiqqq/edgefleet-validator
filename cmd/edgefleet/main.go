@@ -126,8 +126,14 @@ func usage() {
 	fmt.Println("  the partition's previous or the effective watermark, and window-end,")
 	fmt.Println("  event-count or cumulative-sum overflow print the input line number and")
 	fmt.Println("  reason to standard error and stop processing with a non-zero exit; no")
-	fmt.Println("  further records are read and earlier output is retained. Standard")
-	fmt.Println("  output contains window results only.")
+	fmt.Println("  further records are read and earlier output is retained. A window")
+	fmt.Println("  result or late notice that cannot be written completely - the output")
+	fmt.Println("  write fails or accepts only part of the line, even without an error -")
+	fmt.Println("  is likewise fatal: the error names the failed output, the physical")
+	fmt.Println("  input line, the key and window bounds (or the skipped event time and")
+	fmt.Println("  watermark), processing stops without retrying or resending the line")
+	fmt.Println("  or emitting any still-open window, and bytes already written are")
+	fmt.Println("  retained. Standard output contains window results only.")
 }
 
 func runAggregate(args []string) int {
