@@ -20,12 +20,17 @@ package main
 // involved.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/asdhoaiqqq/edgefleet-validator/edgefleet"
 )
 
 const (
@@ -366,5 +371,195 @@ func TestCLIHealthBaselineOnNodeWithoutTelemetryFails(t *testing.T) {
 	}
 	if strings.Contains(out, "baseline_seq") {
 		t.Errorf("notelemetry output must not mention a baseline: %q", out)
+	}
+}
+
+// nodeFilePath mirrors the per-node storage layout used by the store.
+func nodeFilePath(dir, node string) string {
+	return filepath.Join(dir, "nodes", hex.EncodeToString([]byte(node))+".json")
+}
+
+// forgedChecksum returns the checksum the records would carry after a lenient
+// JSON decoder filled missing/null fields with zero values and kept the last
+// duplicate key. A corrupt file written with this checksum proves the reader
+// rejects damaged records even when the checksum matches the interpretation.
+func forgedChecksum(t *testing.T, recordsJSON string) string {
+	t.Helper()
+	var records []edgefleet.Heartbeat
+	if err := json.Unmarshal([]byte(recordsJSON), &records); err != nil {
+		t.Fatalf("lenient parse of %q failed: %v", recordsJSON, err)
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// writeForgedFile overwrites a node file with recordsJSON and a checksum
+// matching the lenient interpretation of those records.
+func writeForgedFile(t *testing.T, dir, node, recordsJSON string) string {
+	t.Helper()
+	path := nodeFilePath(dir, node)
+	content := `{"format":"edgefleet-heartbeats-v1","checksum":"` +
+		forgedChecksum(t, recordsJSON) + `","records":` + recordsJSON + `}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+const corruptRecordMissingMissed = `[{"node":"mono","seq":3,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":103}]`
+
+const corruptRecordDuplicateMissed = `[{"node":"mono","seq":3,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":103,"missed":14,"missed":14}]`
+
+func TestCLIQueriesOnCorruptNodeFail(t *testing.T) {
+	cases := []struct {
+		name        string
+		recordsJSON string
+		wantInErr   string
+	}{
+		{"missing missed with matching checksum", corruptRecordMissingMissed, "missed"},
+		{"duplicate missed with matching checksum", corruptRecordDuplicateMissed, "duplicate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			path := writeForgedFile(t, f.dir, "mono", tc.recordsJSON)
+
+			// Plain health: stderr explains the corruption, exit non-zero,
+			// no normal result on stdout.
+			out, errOut, code := health(t, f,
+				"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "2")
+			if code == 0 {
+				t.Errorf("health must exit non-zero, stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("corrupt health must print nothing on stdout, got %q", out)
+			}
+			for _, want := range []string{"error:", "corruption", path, "record 1", tc.wantInErr} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr %q should contain %q", errOut, want)
+				}
+			}
+
+			// Baseline health must fail identically and never fall back to
+			// another heartbeat.
+			out, errOut, code = health(t, f,
+				"--node", "mono", "--expected-version", "1.26.0",
+				"--tolerated-misses", "2", "--missed-since-seq", "1")
+			if code == 0 {
+				t.Errorf("baseline health must exit non-zero, stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("corrupt baseline health must print nothing on stdout, got %q", out)
+			}
+			if !strings.Contains(errOut, "corruption") || !strings.Contains(errOut, "record 1") {
+				t.Errorf("baseline stderr should report the corrupt record, got %q", errOut)
+			}
+
+			// History: same rules — no rows, clear reason on stderr.
+			out, errOut, code = runCLI(t, f.dir, "",
+				"heartbeat", "history", "--data-dir", f.dir, "--node", "mono")
+			if code == 0 {
+				t.Errorf("history must exit non-zero, stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("corrupt history must print nothing on stdout, got %q", out)
+			}
+			if !strings.Contains(errOut, "corruption") || !strings.Contains(errOut, "record 1") {
+				t.Errorf("history stderr should report the corrupt record, got %q", errOut)
+			}
+		})
+	}
+}
+
+func TestCLISubmitBatchTouchingCorruptNodeIsRejected(t *testing.T) {
+	f := newFixture(t)
+	path := writeForgedFile(t, f.dir, "mono", corruptRecordMissingMissed)
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The batch mixes the corrupt node with a brand-new node: the whole batch
+	// must be refused before anything is saved.
+	input := `[
+	  {"node":"mono","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":104,"missed":15},
+	  {"node":"fresh","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}
+	]`
+	out, errOut, code := runCLI(t, f.dir, input,
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+	if code == 0 {
+		t.Errorf("submit must exit non-zero, stdout=%q", out)
+	}
+	if out != "" {
+		t.Errorf("rejected submit must print nothing on stdout, got %q", out)
+	}
+	for _, want := range []string{"error:", "corruption", "record 1", "missed"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr %q should contain %q", errOut, want)
+		}
+	}
+
+	// The corrupt file is byte-for-byte unchanged: no auto repair, no checksum
+	// regeneration, no truncation.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("corrupt file was modified by the rejected submit")
+	}
+	// The innocent node in the batch must have no file at all.
+	if _, err := os.Stat(nodeFilePath(f.dir, "fresh")); !os.IsNotExist(err) {
+		t.Errorf("fresh node file created despite rejected batch: %v", err)
+	}
+
+	// A later batch touching only healthy nodes works normally.
+	submitBatch(t, f.dir, `[{"node":"fresh","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}]`)
+
+	// And the corrupt node is still refused — nothing about the successful
+	// other-node submission patched it.
+	_, _, code = runCLI(t, f.dir, "",
+		"heartbeat", "history", "--data-dir", f.dir, "--node", "mono")
+	if code == 0 {
+		t.Errorf("corrupt node must still be refused after other-node submit")
+	}
+}
+
+func TestCLICorruptNodeDoesNotAffectOtherNodes(t *testing.T) {
+	f := newFixture(t)
+	writeForgedFile(t, f.dir, "mono", corruptRecordMissingMissed)
+
+	// A different node keeps full normal service.
+	out, errOut, code := health(t, f,
+		"--node", "reset", "--expected-version", "1.26.0",
+		"--tolerated-misses", "2", "--missed-since-seq", "1")
+	if code != 0 {
+		t.Fatalf("healthy node query failed: code=%d stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "node=reset") || !strings.Contains(out, "baseline_seq=1") {
+		t.Errorf("healthy node output wrong: %q", out)
+	}
+
+	out, errOut, code = runCLI(t, f.dir, "",
+		"heartbeat", "history", "--data-dir", f.dir, "--node", "gappy")
+	if code != 0 {
+		t.Fatalf("healthy node history failed: code=%d stderr=%q", code, errOut)
+	}
+	if lines := outputLines(out); len(lines) != 2 {
+		t.Errorf("gappy history should still list 2 rows, got %q", out)
+	}
+
+	// Submitting only to a healthy node succeeds.
+	submitBatch(t, f.dir, `[{"node":"reset","seq":4,"collected_at":"2026-10-01T12:00:00Z","version":"1.25.0","height":204,"missed":14}]`)
+
+	// And the corrupt node still fails.
+	_, _, code = health(t, f, "--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "2")
+	if code == 0 {
+		t.Errorf("corrupt node query must still fail")
 	}
 }

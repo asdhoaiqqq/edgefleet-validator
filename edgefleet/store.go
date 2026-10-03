@@ -1,11 +1,13 @@
 package edgefleet
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,7 +41,9 @@ func IsCorrupt(err error) bool {
 	return errors.As(err, &ce)
 }
 
-// nodeFile is the on-disk layout for one node.
+// nodeFile is the on-disk layout for one node. It is used for writing;
+// reading is done by parseNodeFile, which never lets Go zero values stand in
+// for unsaved telemetry.
 type nodeFile struct {
 	Format   string      `json:"format"`
 	Checksum string      `json:"checksum"`
@@ -110,6 +114,13 @@ func checksumRecords(records []Heartbeat) string {
 // loadNodeFile reads and verifies the file for one node. A missing file means
 // the node has no records (returns nil, nil). Any parse, checksum or
 // structural failure is reported as a CorruptError.
+//
+// Every saved record is re-checked with the same strict rules applied at
+// submission: node, seq, collected_at, version, height and missed must each
+// appear exactly once with a non-null value. A file that omits a field (or
+// writes null) with a checksum matching the resulting zero values is therefore
+// still rejected — a zero value must have been explicitly saved as 0, and
+// duplicate JSON keys never collapse to their last occurrence.
 func loadNodeFile(path string) (*nodeFile, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -118,52 +129,128 @@ func loadNodeFile(path string) (*nodeFile, error) {
 	if err != nil {
 		return nil, &CorruptError{Path: path, Err: err}
 	}
-	var nf nodeFile
-	if err := json.Unmarshal(data, &nf); err != nil {
-		return nil, &CorruptError{Path: path, Err: fmt.Errorf("invalid JSON: %w", err)}
-	}
-	if nf.Format != formatMarker {
-		return nil, &CorruptError{Path: path, Err: fmt.Errorf("unknown format marker %q", nf.Format)}
-	}
-	if nf.Records == nil {
-		nf.Records = []Heartbeat{}
-	}
-	if err := validateStoredRecords(nf.Records); err != nil {
+	nf, err := parseNodeFile(data)
+	if err != nil {
 		return nil, &CorruptError{Path: path, Err: err}
 	}
-	if got := checksumRecords(nf.Records); got != nf.Checksum {
-		return nil, &CorruptError{Path: path, Err: fmt.Errorf("checksum mismatch: stored %s, computed %s", nf.Checksum, got)}
-	}
-	return &nf, nil
+	return nf, nil
 }
 
-// validateStoredRecords checks the structural invariants of a stored record
-// set: sorted by ascending seq, no duplicate seq, valid field values.
-func validateStoredRecords(records []Heartbeat) error {
-	for i, r := range records {
-		if r.NodeID == "" {
-			return fmt.Errorf("record %d: empty node id", i)
+// parseNodeFile strictly parses one on-disk node file and verifies its
+// checksum. All structural validation happens before the checksum is even
+// looked at, so a checksum that matches the file after missing fields were
+// filled with zero values cannot make damaged records acceptable.
+func parseNodeFile(data []byte) (*nodeFile, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("invalid JSON: top-level value must be an object")
+	}
+
+	envelope := make(map[string]json.RawMessage)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("invalid JSON: %w", err)
 		}
-		if r.Seq <= 0 {
-			return fmt.Errorf("record %d: seq must be a positive integer, got %d", i, r.Seq)
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid JSON: field name must be a string")
 		}
-		if r.Version == "" {
-			return fmt.Errorf("record %d: empty version", i)
+		if _, exists := envelope[key]; exists {
+			return nil, fmt.Errorf("duplicate field %q in file header", key)
 		}
-		if r.Height < 0 {
-			return fmt.Errorf("record %d: negative height %d", i, r.Height)
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil, fmt.Errorf("invalid JSON: invalid value for field %q: %w", key, err)
 		}
-		if r.Missed < 0 {
-			return fmt.Errorf("record %d: negative missed %d", i, r.Missed)
+		envelope[key] = val
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	// Reject trailing data after the object (json.Decoder stops at the first
+	// valid value); the file must contain exactly one envelope object.
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("invalid JSON: trailing data after file object")
 		}
-		if r.CollectedAt.IsZero() {
-			return fmt.Errorf("record %d: missing collected_at", i)
-		}
-		if i > 0 && records[i-1].Seq >= r.Seq {
-			return fmt.Errorf("records not sorted by ascending seq at position %d", i)
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	for _, f := range []string{"format", "checksum", "records"} {
+		if _, ok := envelope[f]; !ok {
+			return nil, fmt.Errorf("missing required file field %q", f)
 		}
 	}
-	return nil
+	for k := range envelope {
+		switch k {
+		case "format", "checksum", "records":
+		default:
+			return nil, fmt.Errorf("unknown file field %q", k)
+		}
+	}
+
+	if bytes.Equal(envelope["format"], []byte("null")) {
+		return nil, fmt.Errorf(`file field "format" must not be null`)
+	}
+	var format string
+	if err := json.Unmarshal(envelope["format"], &format); err != nil {
+		return nil, fmt.Errorf(`file field "format" must be a string: %w`, err)
+	}
+	if format != formatMarker {
+		return nil, fmt.Errorf("unknown format marker %q", format)
+	}
+
+	if bytes.Equal(envelope["checksum"], []byte("null")) {
+		return nil, fmt.Errorf(`file field "checksum" must not be null`)
+	}
+	var checksum string
+	if err := json.Unmarshal(envelope["checksum"], &checksum); err != nil {
+		return nil, fmt.Errorf(`file field "checksum" must be a string: %w`, err)
+	}
+
+	rawRecords := envelope["records"]
+	if bytes.Equal(rawRecords, []byte("null")) {
+		return nil, fmt.Errorf(`file field "records" must not be null`)
+	}
+	rd := json.NewDecoder(bytes.NewReader(rawRecords))
+	tok, err = rd.Token()
+	if err != nil {
+		return nil, fmt.Errorf(`file field "records" must be an array: %w`, err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		return nil, fmt.Errorf(`file field "records" must be an array`)
+	}
+
+	records := []Heartbeat{}
+	idx := 0
+	for rd.More() {
+		var raw json.RawMessage
+		if err := rd.Decode(&raw); err != nil {
+			return nil, fmt.Errorf("record %d: invalid JSON value: %w", idx+1, err)
+		}
+		h, err := parseHeartbeatFields(raw)
+		if err != nil {
+			return nil, fmt.Errorf("record %d: %w", idx+1, err)
+		}
+		if idx > 0 && records[idx-1].Seq >= h.Seq {
+			return nil, fmt.Errorf("records not sorted by ascending seq at position %d", idx+1)
+		}
+		records = append(records, h)
+		idx++
+	}
+	if _, err := rd.Token(); err != nil {
+		return nil, fmt.Errorf(`file field "records": %w`, err)
+	}
+
+	if got := checksumRecords(records); got != checksum {
+		return nil, fmt.Errorf("checksum mismatch: stored %s, computed %s", checksum, got)
+	}
+	return &nodeFile{Format: format, Checksum: checksum, Records: records}, nil
 }
 
 // writeNodeFile persists records atomically: a temp file in the same

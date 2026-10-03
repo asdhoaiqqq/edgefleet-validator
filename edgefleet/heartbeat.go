@@ -102,7 +102,14 @@ func rejectNull(raw json.RawMessage, field string) error {
 	return nil
 }
 
-func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
+// parseHeartbeatFields strictly parses one heartbeat JSON object. The exact
+// field set in heartbeatFields must be present exactly once: a missing field,
+// a null value, an unknown field or a duplicated field name is rejected. This
+// is used both for submitted input and for records read back from disk, so an
+// omitted or null telemetry field can never be silently filled with the Go
+// zero value, and a duplicate JSON key can never let the last occurrence win.
+// The receive-time comparison is intentionally left to the caller.
+func parseHeartbeatFields(raw json.RawMessage) (Heartbeat, error) {
 	// Walk the object with a streaming decoder so duplicate field names are
 	// detected. Field names are compared as the JSON string they represent:
 	// "missed" and "m\u0069ssed" are the same field. A map-based unmarshal
@@ -216,6 +223,14 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, fmt.Errorf("missed must be >= 0, got %d", h.Missed)
 	}
 
+	return h, nil
+}
+
+func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, error) {
+	h, err := parseHeartbeatFields(raw)
+	if err != nil {
+		return Heartbeat{}, err
+	}
 	if h.CollectedAt.After(receiveTime) {
 		return Heartbeat{}, fmt.Errorf("collected_at %s is later than receive time %s",
 			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
