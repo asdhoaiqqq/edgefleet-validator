@@ -546,15 +546,11 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
 		}
 		s.partWatermark[p] = &next
-		if effective := s.effectiveWatermark(); effective != nil {
-			s.watermark = effective
-		}
 	}
 
-	if s.watermark == nil {
-		return nil
-	}
-	return s.closeWindows(*s.watermark, lineNo)
+	// A watermark update and an idle declaration share one advance-and-close
+	// path from here so both triggers follow the same rules.
+	return s.advanceWatermark(lineNo)
 }
 
 // processIdle declares a partition idle: it stops contributing to the
@@ -565,14 +561,31 @@ func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int)
 	if err != nil {
 		return err
 	}
-	wasIdle := s.idle[p]
+	if s.idle[p] {
+		// A repeated idle declaration is a no-op: the partition already
+		// stopped contributing, so neither the effective watermark nor the
+		// set of closable windows can change.
+		return nil
+	}
 	s.idle[p] = true
+	// With the partition excluded, the remaining non-idle partitions
+	// determine the effective watermark; the declaration itself can advance
+	// it and close windows, exactly like a watermark update.
+	return s.advanceWatermark(lineNo)
+}
 
-	// Recompute the effective watermark. With the partition excluded, the
-	// remaining non-idle partitions determine it; if every partition is idle
-	// the last produced effective watermark is retained instead of clearing.
-	// Repeated idle declarations do not change the state of the windows.
-	if !wasIdle {
+// advanceWatermark applies a partition state change -- a partition watermark
+// update or an idle declaration -- and closes every window the resulting
+// watermark allows. Both triggers funnel through here so they follow the
+// same rules: in partitioned mode the effective watermark is recomputed from
+// the current partition state (an active partition that has not reported yet
+// keeps it unknown, and when every partition is idle the last produced value
+// is retained instead of clearing); in legacy single-watermark mode the
+// single watermark is used as is. While no effective watermark exists no
+// window closes; otherwise closeWindows emits every window whose end is less
+// than or equal to it.
+func (s *aggregateState) advanceWatermark(lineNo int) error {
+	if s.partitions > 0 {
 		if next := s.effectiveWatermark(); next != nil {
 			s.watermark = next
 		}
