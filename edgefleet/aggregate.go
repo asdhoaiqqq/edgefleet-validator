@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // AggregateResult is one closed window output line.
@@ -103,7 +104,13 @@ type windowState struct {
 // still-open windows produce no further results; content already accepted
 // by the writers stays in place, including fully written earlier results.
 // Fatal record problems return *InputError; results already written to out
-// stay written, and open windows are not flushed at end of input.
+// stay written, and open windows are not flushed at end of input. An event
+// key that would lose characters when decoded -- invalid UTF-8 bytes, or a
+// \u escape whose surrogate half is unpaired or mispaired -- is such a fatal
+// problem: it is never repaired to U+FFFD and counted, so distinct damaged
+// keys can never merge or collide with a key that is genuinely U+FFFD. The
+// check runs before the late-event check, so a damaged key is fatal even
+// below the current watermark.
 //
 // A read failure is distinct from reaching the end of input. Only a reader
 // returning the bare io.EOF sentinel is a clean end, where a final record that
@@ -443,7 +450,7 @@ func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
 }
 
 func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
-	key, err := requiredString(obj, "key", lineNo)
+	key, err := requiredKey(obj, lineNo)
 	if err != nil {
 		return err
 	}
@@ -696,6 +703,147 @@ func requiredString(obj map[string]json.RawMessage, field string, lineNo int) (s
 		return "", &InputError{Line: lineNo, Reason: err.Error()}
 	}
 	return value, nil
+}
+
+// requiredKey returns the event key decoded strictly. encoding/json silently
+// repairs damaged string content with U+FFFD -- invalid UTF-8 bytes and \u
+// escapes whose surrogate halves are unpaired or mispaired -- which would
+// merge distinct damaged keys into one and collide with a key that is
+// genuinely U+FFFD. Such damage is a fatal input error here instead, so a
+// corrupt key never changes any window's count or sum. Valid characters
+// (including a directly encoded or escaped U+FFFD and supplementary-plane
+// characters, whether literal or written as a surrogate pair) decode to
+// their exact value and aggregate as before.
+func requiredKey(obj map[string]json.RawMessage, lineNo int) (string, error) {
+	raw, ok := obj["key"]
+	if !ok {
+		return "", &InputError{Line: lineNo, Reason: `missing required string field "key"`}
+	}
+	key, err := decodeKeyString(raw)
+	if err != nil {
+		return "", &InputError{Line: lineNo, Reason: err.Error()}
+	}
+	return key, nil
+}
+
+// decodeKeyString decodes the event key's JSON string without the lossy
+// repairs encoding/json applies: invalid UTF-8 byte sequences and \u escapes
+// with unpaired or mispaired surrogate halves are errors instead of becoming
+// U+FFFD. The record already parsed as JSON, so the string's escape syntax
+// is valid; only its character content is checked here. An escaped backslash
+// is decoded first, so "\\uD800" stays the literal text D800 and is not
+// mistaken for an unpaired surrogate.
+func decodeKeyString(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '"' || trimmed[len(trimmed)-1] != '"' {
+		return "", fmt.Errorf("field %q must be a JSON string, got %s", "key", string(trimmed))
+	}
+	s := string(trimmed[1 : len(trimmed)-1])
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '\\':
+			if i+1 >= len(s) {
+				return "", fmt.Errorf("field %q ends in an incomplete escape", "key")
+			}
+			switch s[i+1] {
+			case '"', '\\', '/':
+				sb.WriteByte(s[i+1])
+				i += 2
+			case 'b':
+				sb.WriteByte('\b')
+				i += 2
+			case 'f':
+				sb.WriteByte('\f')
+				i += 2
+			case 'n':
+				sb.WriteByte('\n')
+				i += 2
+			case 'r':
+				sb.WriteByte('\r')
+				i += 2
+			case 't':
+				sb.WriteByte('\t')
+				i += 2
+			case 'u':
+				r, next, err := decodeUnicodeEscape(s, i)
+				if err != nil {
+					return "", err
+				}
+				sb.WriteRune(r)
+				i = next
+			default:
+				return "", fmt.Errorf("field %q has an invalid escape \\%c", "key", s[i+1])
+			}
+		case c < utf8.RuneSelf:
+			sb.WriteByte(c)
+			i++
+		default:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				return "", fmt.Errorf("field %q contains invalid UTF-8 bytes in its character encoding", "key")
+			}
+			sb.WriteString(s[i : i+size])
+			i += size
+		}
+	}
+	return sb.String(), nil
+}
+
+// decodeUnicodeEscape decodes the \uXXXX escape at s[i] (where s[i] == '\\'
+// and s[i+1] == 'u'), returning the decoded rune and the index just past the
+// escape. A high surrogate must be immediately followed by a \u escape
+// carrying the matching low surrogate; the pair combines into one
+// supplementary-plane rune. An unpaired or mispaired half is an error rather
+// than U+FFFD.
+func decodeUnicodeEscape(s string, i int) (rune, int, error) {
+	r, next, err := parseHexEscape(s, i)
+	if err != nil {
+		return 0, 0, err
+	}
+	switch {
+	case r >= 0xD800 && r <= 0xDBFF:
+		if next+1 >= len(s) || s[next] != '\\' || s[next+1] != 'u' {
+			return 0, 0, fmt.Errorf("field %q has an unpaired high surrogate in a Unicode escape", "key")
+		}
+		lo, after, err := parseHexEscape(s, next)
+		if err != nil {
+			return 0, 0, err
+		}
+		if lo < 0xDC00 || lo > 0xDFFF {
+			return 0, 0, fmt.Errorf("field %q has a high surrogate not followed by a low surrogate in a Unicode escape", "key")
+		}
+		return 0x10000 + (r-0xD800)<<10 + (lo - 0xDC00), after, nil
+	case r >= 0xDC00 && r <= 0xDFFF:
+		return 0, 0, fmt.Errorf("field %q has an unpaired low surrogate in a Unicode escape", "key")
+	}
+	return r, next, nil
+}
+
+// parseHexEscape reads the four hex digits of the \uXXXX escape at s[i]
+// (where s[i] == '\\' and s[i+1] == 'u') and returns their value and the
+// index just past them.
+func parseHexEscape(s string, i int) (rune, int, error) {
+	if i+6 > len(s) {
+		return 0, 0, fmt.Errorf("field %q has a truncated Unicode escape", "key")
+	}
+	var v rune
+	for _, c := range s[i+2 : i+6] {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v += c - '0'
+		case c >= 'a' && c <= 'f':
+			v += c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			v += c - 'A' + 10
+		default:
+			return 0, 0, fmt.Errorf("field %q has a non-hex digit in a Unicode escape", "key")
+		}
+	}
+	return v, i + 6, nil
 }
 
 func requiredInt64(obj map[string]json.RawMessage, field string, lineNo int) (int64, error) {
