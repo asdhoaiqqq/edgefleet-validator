@@ -118,7 +118,14 @@ func checksumRecords(records []Heartbeat) string {
 // checksum that matches the zero-filled interpretation of a tampered record
 // therefore cannot make a missing value look like real telemetry — the
 // record is rejected before the checksum is consulted.
-func loadNodeFile(path string) (*nodeFile, error) {
+//
+// Ownership is verified as well: the file lives at the path derived from
+// expectedNode, so every record must declare that same node. A complete,
+// checksum-valid file copied from another node is still corruption here —
+// one node's telemetry must never be served as another node's history or
+// health. Node ids are compared as exact strings, so ids containing spaces,
+// slashes or non-ASCII characters keep their distinct files.
+func loadNodeFile(path, expectedNode string) (*nodeFile, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -134,6 +141,9 @@ func loadNodeFile(path string) (*nodeFile, error) {
 		return nil, &CorruptError{Path: path, Err: fmt.Errorf("unknown format marker %q", nf.Format)}
 	}
 	if err := validateStoredRecords(nf.Records); err != nil {
+		return nil, &CorruptError{Path: path, Err: err}
+	}
+	if err := validateRecordOwnership(expectedNode, nf.Records); err != nil {
 		return nil, &CorruptError{Path: path, Err: err}
 	}
 	if got := checksumRecords(nf.Records); got != nf.Checksum {
@@ -283,6 +293,24 @@ func validateStoredRecords(records []Heartbeat) error {
 	return nil
 }
 
+// validateRecordOwnership enforces that every record stored in a node's file
+// actually belongs to that node. The file path already encodes the node id;
+// a record naming any other node means the file was copied from (or mixed
+// with) another node's telemetry, which must be refused as corruption no
+// matter how complete or checksum-valid it is. The whole file is rejected at
+// the first foreign record, including records buried in old history or
+// before a query baseline. Position numbers are 1-based to match decoder
+// errors. Node ids are compared as exact, unsanitised strings.
+func validateRecordOwnership(expectedNode string, records []Heartbeat) error {
+	for i, r := range records {
+		if r.NodeID != expectedNode {
+			return fmt.Errorf("record %d belongs to node %q, but this file holds node %q telemetry",
+				i+1, r.NodeID, expectedNode)
+		}
+	}
+	return nil
+}
+
 // writeNodeFile persists records atomically: a temp file in the same
 // directory is fsynced and renamed over the target, so a crash never leaves
 // a half-written file.
@@ -387,7 +415,7 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 	var updates []update
 	for nodeID, batch := range merged {
 		path := s.nodePath(nodeID)
-		nf, err := loadNodeFile(path)
+		nf, err := loadNodeFile(path, nodeID)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -497,7 +525,7 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 	}
 	defer unlock()
 
-	nf, err := loadNodeFile(s.nodePath(nodeID))
+	nf, err := loadNodeFile(s.nodePath(nodeID), nodeID)
 	if err != nil {
 		return HealthResult{}, err
 	}
@@ -611,7 +639,7 @@ func (s *Store) History(nodeID string) ([]Heartbeat, error) {
 	}
 	defer unlock()
 
-	nf, err := loadNodeFile(s.nodePath(nodeID))
+	nf, err := loadNodeFile(s.nodePath(nodeID), nodeID)
 	if err != nil {
 		return nil, err
 	}
