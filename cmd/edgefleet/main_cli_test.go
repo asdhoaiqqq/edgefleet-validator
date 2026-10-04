@@ -629,3 +629,111 @@ func TestCLIMisownedNodeFileIsRefused(t *testing.T) {
 		t.Errorf("real owner must still query normally: code=%d out=%q", code, out)
 	}
 }
+
+// TestCLISubmitRejectsInvalidUTF8Node exercises the user-visible contract for
+// a node id that is not losslessly representable text: the JSON input holds
+// a raw invalid UTF-8 byte, which a lenient reader would silently rewrite to
+// "�" and merge into another node. The whole batch must be refused with a
+// non-zero exit, no success counts on stdout, an error naming the record and
+// the node field on stderr, and no change to any stored data.
+func TestCLISubmitRejectsInvalidUTF8Node(t *testing.T) {
+	f := newFixture(t)
+	monoBefore := readNodeFile(t, f.dir, "mono")
+
+	badRecord := `{"node":"val-` + "\xff" + `1","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}`
+	goodRecord := `{"node":"mono","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":104,"missed":15}`
+	out, errOut, code := runCLI(t, f.dir, "["+goodRecord+","+badRecord+"]",
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+	if code == 0 {
+		t.Errorf("submit with an invalid UTF-8 node id must exit non-zero; stdout=%q", out)
+	}
+	if strings.Contains(out, "submitted") {
+		t.Errorf("rejected batch must not print success counts, stdout=%q", out)
+	}
+	if !strings.Contains(errOut, "record 2") || !strings.Contains(errOut, "node") {
+		t.Errorf("stderr must name the failing record and the node field, got %q", errOut)
+	}
+
+	// The valid record in the same batch is not saved either.
+	if got := readNodeFile(t, f.dir, "mono"); got != monoBefore {
+		t.Errorf("existing node file changed during rejected submit")
+	}
+	if _, err := os.Stat(nodeFileHexPath(f.dir, "val-�1")); !os.IsNotExist(err) {
+		t.Errorf("no node file may be created for the rewritten id, stat err=%v", err)
+	}
+
+	// Health answers for the existing node are unchanged.
+	out, _, code = health(t, f,
+		"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "9")
+	if code != 0 || !strings.Contains(out, "seq=3") {
+		t.Errorf("health after rejected batch changed: code=%d out=%q", code, out)
+	}
+}
+
+// TestCLISubmitRejectsUnpairedSurrogate covers the other silent rewrite: a
+// \u escape that is an unpaired surrogate decodes to "�" instead of the
+// intended character. The batch is refused and no node file is created.
+func TestCLISubmitRejectsUnpairedSurrogate(t *testing.T) {
+	dir := t.TempDir()
+	batch := `[{"node":"val-\uD83D","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}]`
+	out, errOut, code := runCLI(t, dir, batch,
+		"heartbeat", "submit", "--data-dir", dir, "--receive-time", cliReceiveAt)
+	if code == 0 {
+		t.Errorf("submit with an unpaired surrogate must exit non-zero; stdout=%q", out)
+	}
+	if !strings.Contains(errOut, "record 1") || !strings.Contains(errOut, "node") {
+		t.Errorf("stderr must name the failing record and the node field, got %q", errOut)
+	}
+	// The batch is refused before the store is touched: no node file exists.
+	files, err := os.ReadDir(filepath.Join(dir, "nodes"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Errorf("no node file may be created, found %d", len(files))
+	}
+}
+
+// TestCLISubmitValidUnicodeNodeRoundTrip checks the legal cases keep working
+// end to end: a literal "�" is a valid character the user typed, an emoji
+// written as a surrogate-pair escape is the same node as its literal form,
+// and both are queryable by their original id.
+func TestCLISubmitValidUnicodeNodeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	// Literal replacement character: a legal id, accepted as-is.
+	out, _, code := runCLI(t, dir,
+		`[{"node":"val-�","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}]`,
+		"heartbeat", "submit", "--data-dir", dir, "--receive-time", cliReceiveAt)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("literal replacement char must be accepted: code=%d out=%q", code, out)
+	}
+
+	// The same text as a � escape is the same node: duplicate, not new.
+	out, _, code = runCLI(t, dir,
+		`[{"node":"val-\uFFFD","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}]`,
+		"heartbeat", "submit", "--data-dir", dir, "--receive-time", cliReceiveAt)
+	if code != 0 || !strings.Contains(out, "new=0 duplicate=1") {
+		t.Errorf("escaped form of the same id must be a duplicate: code=%d out=%q", code, out)
+	}
+
+	// An emoji written as a surrogate-pair escape is stored under the emoji.
+	out, _, code = runCLI(t, dir,
+		`[{"node":"val-\uD83D\uDE00","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":2,"missed":0}]`,
+		"heartbeat", "submit", "--data-dir", dir, "--receive-time", cliReceiveAt)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("surrogate-pair escape must be accepted: code=%d out=%q", code, out)
+	}
+
+	// Both nodes are queryable by their original ids.
+	out, _, code = runCLI(t, dir, "",
+		"heartbeat", "history", "--data-dir", dir, "--node", "val-�")
+	if code != 0 || !strings.Contains(out, "node=val-� seq=1") {
+		t.Errorf("history for literal replacement char id: code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, dir, "",
+		"heartbeat", "history", "--data-dir", dir, "--node", "val-😀")
+	if code != 0 || !strings.Contains(out, "node=val-😀 seq=1") {
+		t.Errorf("history for emoji id: code=%d out=%q", code, out)
+	}
+}

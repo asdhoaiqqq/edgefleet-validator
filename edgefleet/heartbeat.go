@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // Heartbeat is one telemetry record reported by a node.
@@ -35,6 +36,9 @@ var heartbeatFields = []string{"node", "seq", "collected_at", "version", "height
 func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
 	if h.NodeID == "" {
 		return fmt.Errorf("node id is empty")
+	}
+	if !utf8.ValidString(h.NodeID) {
+		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
 	}
 	if h.Seq <= 0 {
 		return fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
@@ -167,6 +171,9 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["node"], &h.NodeID); err != nil {
 		return Heartbeat{}, fmt.Errorf("node must be a string: %w", err)
 	}
+	if err := validateRawNodeText(fields["node"]); err != nil {
+		return Heartbeat{}, err
+	}
 	if h.NodeID == "" {
 		return Heartbeat{}, fmt.Errorf("node must not be empty")
 	}
@@ -225,6 +232,95 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	}
 
 	return h, nil
+}
+
+// validateRawNodeText checks the raw JSON string token of the node field
+// before its decoded value is trusted. encoding/json silently rewrites
+// invalid UTF-8 bytes and unpaired \u surrogate escapes to U+FFFD, which
+// would merge distinct node ids into one replacement-char id and break the
+// ownership check against stored files. The raw token must decode
+// losslessly: every literal byte sequence must be valid UTF-8, and every \u
+// escape must be a valid scalar value or a properly paired high/low
+// surrogate pair. A literal "�" (or its \uFFFD escape) is valid text the
+// user typed and is accepted; only undecodable input is rejected.
+func validateRawNodeText(raw json.RawMessage) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return fmt.Errorf("node must be a string")
+	}
+	s := raw[1 : len(raw)-1]
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == '\\' {
+			if i+1 >= len(s) {
+				return fmt.Errorf("node contains a truncated escape")
+			}
+			if s[i+1] != 'u' {
+				i += 2
+				continue
+			}
+			if i+6 > len(s) {
+				return fmt.Errorf("node contains a truncated \\u escape")
+			}
+			r, err := parseHex4(s[i+2 : i+6])
+			if err != nil {
+				return fmt.Errorf("node contains an invalid \\u escape: %w", err)
+			}
+			switch {
+			case r >= 0xD800 && r <= 0xDBFF:
+				// A high surrogate is only valid when immediately followed
+				// by a low-surrogate \u escape.
+				if i+12 > len(s) || s[i+6] != '\\' || s[i+7] != 'u' {
+					return fmt.Errorf("node contains an unpaired high surrogate \\u%04X", r)
+				}
+				lo, err := parseHex4(s[i+8 : i+12])
+				if err != nil {
+					return fmt.Errorf("node contains an invalid \\u escape: %w", err)
+				}
+				if lo < 0xDC00 || lo > 0xDFFF {
+					return fmt.Errorf("node contains an unpaired high surrogate \\u%04X", r)
+				}
+				i += 12
+			case r >= 0xDC00 && r <= 0xDFFF:
+				return fmt.Errorf("node contains an unpaired low surrogate \\u%04X", r)
+			default:
+				i += 6
+			}
+			continue
+		}
+		if c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		// A valid multi-byte rune decodes with size >= 2; size 1 means the
+		// bytes are not valid UTF-8 (including surrogate encodings).
+		_, size := utf8.DecodeRune(s[i:])
+		if size == 1 {
+			return fmt.Errorf("node contains invalid UTF-8 at byte offset %d", i)
+		}
+		i += size
+	}
+	return nil
+}
+
+// parseHex4 parses exactly four hexadecimal digits as a 16-bit value.
+func parseHex4(b []byte) (rune, error) {
+	v := 0
+	for _, c := range b {
+		var d int
+		switch {
+		case '0' <= c && c <= '9':
+			d = int(c - '0')
+		case 'a' <= c && c <= 'f':
+			d = int(c-'a') + 10
+		case 'A' <= c && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, fmt.Errorf("invalid hex digit %q", c)
+		}
+		v = v*16 + d
+	}
+	return rune(v), nil
 }
 
 // parseOneHeartbeat decodes one submit-input record and applies the
