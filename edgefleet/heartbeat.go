@@ -30,36 +30,189 @@ type Heartbeat struct {
 // heartbeatFields enumerates every field that must be explicitly provided.
 var heartbeatFields = []string{"node", "seq", "collected_at", "version", "height", "missed"}
 
-// ValidateHeartbeat checks the semantic rules for one record. receiveTime is
-// the moment the platform received the batch; a collection time later than
-// receive time is rejected.
-func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
-	if h.NodeID == "" {
-		return fmt.Errorf("node id is empty")
+// fieldIssue classifies the way a field value violates a rule. Together with
+// the field name and the offending numeric value it identifies the rule that
+// failed, without carrying any wording. Each trust boundary renders the
+// failure in its own message style and locates it in its own context, but the
+// rules themselves — which values are legal — live in the check* functions
+// below exactly once.
+type fieldIssue int
+
+const (
+	issueEmpty          fieldIssue = iota // a required string is ""
+	issueInvalidUnicode                   // node id is not lossless text
+	issueNotPositive                      // integer must be > 0
+	issueNegative                         // integer must be >= 0
+	issueMissingInstant                   // collected_at is the zero instant
+)
+
+// fieldValueError names the field whose value rule was violated.
+type fieldValueError struct {
+	field string
+	issue fieldIssue
+	value int64
+}
+
+// checkNodeIDValue holds the single node-id value rule: non-empty, valid
+// Unicode text. The raw-JSON boundary additionally checks the un-decoded
+// token (see validateRawNodeText); for a value already decoded from such a
+// token the Unicode branch can never fire, but both submit entries and the
+// stored-data read enforce the same rule through this one function.
+func checkNodeIDValue(node string) *fieldValueError {
+	if node == "" {
+		return &fieldValueError{field: "node", issue: issueEmpty}
 	}
-	if !utf8.ValidString(h.NodeID) {
-		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
-	}
-	if h.Seq <= 0 {
-		return fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
-	}
-	if h.Version == "" {
-		return fmt.Errorf("version is empty")
-	}
-	if h.Height < 0 {
-		return fmt.Errorf("height must be >= 0, got %d", h.Height)
-	}
-	if h.Missed < 0 {
-		return fmt.Errorf("missed must be >= 0, got %d", h.Missed)
-	}
-	if h.CollectedAt.IsZero() {
-		return fmt.Errorf("collected_at is missing or invalid")
-	}
-	if h.CollectedAt.After(receiveTime) {
-		return fmt.Errorf("collected_at %s is later than receive time %s",
-			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
+	if !utf8.ValidString(node) {
+		return &fieldValueError{field: "node", issue: issueInvalidUnicode}
 	}
 	return nil
+}
+
+// checkNonEmptyString holds the single non-empty-string value rule, shared by
+// every field that uses it (currently version).
+func checkNonEmptyString(field, value string) *fieldValueError {
+	if value == "" {
+		return &fieldValueError{field: field, issue: issueEmpty}
+	}
+	return nil
+}
+
+// checkPositiveInt holds the single positive-integer rule (seq).
+func checkPositiveInt(field string, value int64) *fieldValueError {
+	if value <= 0 {
+		return &fieldValueError{field: field, issue: issueNotPositive, value: value}
+	}
+	return nil
+}
+
+// checkNonNegativeInt holds the single non-negative-integer rule (height,
+// missed). An explicit zero is genuine telemetry and passes.
+func checkNonNegativeInt(field string, value int64) *fieldValueError {
+	if value < 0 {
+		return &fieldValueError{field: field, issue: issueNegative, value: value}
+	}
+	return nil
+}
+
+// checkCollectedAtValue holds the single rule that a collection instant must
+// actually be present (not the zero time).
+func checkCollectedAtValue(collected time.Time) *fieldValueError {
+	if collected.IsZero() {
+		return &fieldValueError{field: "collected_at", issue: issueMissingInstant}
+	}
+	return nil
+}
+
+// checkHeartbeatValues runs every context-free field-value rule in the single
+// rejection order shared by the direct-submit and stored-data boundaries:
+// node, seq, version, height, missed, then collected_at. It deliberately does
+// NOT compare against a receive time: reading saved history has no receive
+// time, and that submit-only rule lives in checkCollectedAtTiming.
+func checkHeartbeatValues(h Heartbeat) *fieldValueError {
+	if e := checkNodeIDValue(h.NodeID); e != nil {
+		return e
+	}
+	if e := checkPositiveInt("seq", h.Seq); e != nil {
+		return e
+	}
+	if e := checkNonEmptyString("version", h.Version); e != nil {
+		return e
+	}
+	if e := checkNonNegativeInt("height", h.Height); e != nil {
+		return e
+	}
+	if e := checkNonNegativeInt("missed", h.Missed); e != nil {
+		return e
+	}
+	return checkCollectedAtValue(h.CollectedAt)
+}
+
+// checkCollectedAtTiming holds the single receive-time rule, which belongs to
+// submission only: a collection time later than the receive time is refused;
+// the same instant expressed in another timezone is equal and allowed. The
+// stored-data read path never calls this, so reading history introduces no
+// current time and no extra time limit.
+func checkCollectedAtTiming(collected, receiveTime time.Time) error {
+	if collected.After(receiveTime) {
+		return fmt.Errorf("collected_at %s is later than receive time %s",
+			collected.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// directError renders a field rule failure in ValidateHeartbeat's wording,
+// used when a caller submits an already constructed Heartbeat.
+func (e *fieldValueError) directError() error {
+	switch {
+	case e.field == "node" && e.issue == issueEmpty:
+		return fmt.Errorf("node id is empty")
+	case e.field == "node" && e.issue == issueInvalidUnicode:
+		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
+	case e.field == "seq":
+		return fmt.Errorf("seq must be a positive integer, got %d", e.value)
+	case e.field == "version":
+		return fmt.Errorf("version is empty")
+	case e.field == "height":
+		return fmt.Errorf("height must be >= 0, got %d", e.value)
+	case e.field == "missed":
+		return fmt.Errorf("missed must be >= 0, got %d", e.value)
+	case e.field == "collected_at":
+		return fmt.Errorf("collected_at is missing or invalid")
+	default:
+		return fmt.Errorf("field %q has an invalid value", e.field)
+	}
+}
+
+// decodeError renders a field rule failure in the wording used while decoding
+// a strict JSON object (submit input and stored records alike).
+func (e *fieldValueError) decodeError() error {
+	switch {
+	case e.field == "node" && e.issue == issueInvalidUnicode:
+		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
+	case e.field == "node":
+		return fmt.Errorf("node must not be empty")
+	case e.field == "seq":
+		return fmt.Errorf("seq must be a positive integer, got %d", e.value)
+	case e.field == "version":
+		return fmt.Errorf("version must not be empty")
+	case e.field == "height":
+		return fmt.Errorf("height must be >= 0, got %d", e.value)
+	case e.field == "missed":
+		return fmt.Errorf("missed must be >= 0, got %d", e.value)
+	default:
+		return fmt.Errorf("invalid value for field %q", e.field)
+	}
+}
+
+// storedError renders a field rule failure for a record read from a saved
+// file, prefixing the 1-based record position as stored-data errors do.
+func (e *fieldValueError) storedError(position int) error {
+	switch {
+	case e.field == "node" && e.issue == issueInvalidUnicode:
+		return fmt.Errorf("record %d: field %q is not valid Unicode text", position, e.field)
+	case e.field == "node" || e.field == "version":
+		return fmt.Errorf("record %d: field %q must not be empty", position, e.field)
+	case e.field == "seq":
+		return fmt.Errorf("record %d: field %q must be a positive integer, got %d", position, e.field, e.value)
+	case e.field == "height" || e.field == "missed":
+		return fmt.Errorf("record %d: field %q must be >= 0, got %d", position, e.field, e.value)
+	case e.field == "collected_at":
+		return fmt.Errorf("record %d: field %q is missing or invalid", position, e.field)
+	default:
+		return fmt.Errorf("record %d: field %q has an invalid value", position, e.field)
+	}
+}
+
+// ValidateHeartbeat checks the semantic rules for one record. receiveTime is
+// the moment the platform received the batch; a collection time later than
+// receive time is rejected. The field-value rules are shared with JSON
+// parsing and the stored-file read path via checkHeartbeatValues; only the
+// receive-time comparison is submit-specific.
+func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
+	if e := checkHeartbeatValues(h); e != nil {
+		return e.directError()
+	}
+	return checkCollectedAtTiming(h.CollectedAt, receiveTime)
 }
 
 // Equal reports whether two records are the same telemetry. Collection times
@@ -174,8 +327,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := validateRawNodeText(fields["node"]); err != nil {
 		return Heartbeat{}, err
 	}
-	if h.NodeID == "" {
-		return Heartbeat{}, fmt.Errorf("node must not be empty")
+	if e := checkNodeIDValue(h.NodeID); e != nil {
+		return Heartbeat{}, e.decodeError()
 	}
 
 	if err := rejectNull(fields["seq"], "seq"); err != nil {
@@ -184,8 +337,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["seq"], &h.Seq); err != nil {
 		return Heartbeat{}, fmt.Errorf("seq must be an integer: %w", err)
 	}
-	if h.Seq <= 0 {
-		return Heartbeat{}, fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
+	if e := checkPositiveInt("seq", h.Seq); e != nil {
+		return Heartbeat{}, e.decodeError()
 	}
 
 	if err := rejectNull(fields["collected_at"], "collected_at"); err != nil {
@@ -207,8 +360,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["version"], &h.Version); err != nil {
 		return Heartbeat{}, fmt.Errorf("version must be a string: %w", err)
 	}
-	if h.Version == "" {
-		return Heartbeat{}, fmt.Errorf("version must not be empty")
+	if e := checkNonEmptyString("version", h.Version); e != nil {
+		return Heartbeat{}, e.decodeError()
 	}
 
 	if err := rejectNull(fields["height"], "height"); err != nil {
@@ -217,8 +370,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["height"], &h.Height); err != nil {
 		return Heartbeat{}, fmt.Errorf("height must be an integer: %w", err)
 	}
-	if h.Height < 0 {
-		return Heartbeat{}, fmt.Errorf("height must be >= 0, got %d", h.Height)
+	if e := checkNonNegativeInt("height", h.Height); e != nil {
+		return Heartbeat{}, e.decodeError()
 	}
 
 	if err := rejectNull(fields["missed"], "missed"); err != nil {
@@ -227,8 +380,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["missed"], &h.Missed); err != nil {
 		return Heartbeat{}, fmt.Errorf("missed must be an integer: %w", err)
 	}
-	if h.Missed < 0 {
-		return Heartbeat{}, fmt.Errorf("missed must be >= 0, got %d", h.Missed)
+	if e := checkNonNegativeInt("missed", h.Missed); e != nil {
+		return Heartbeat{}, e.decodeError()
 	}
 
 	return h, nil
@@ -330,9 +483,8 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 	if err != nil {
 		return Heartbeat{}, err
 	}
-	if h.CollectedAt.After(receiveTime) {
-		return Heartbeat{}, fmt.Errorf("collected_at %s is later than receive time %s",
-			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
+	if err := checkCollectedAtTiming(h.CollectedAt, receiveTime); err != nil {
+		return Heartbeat{}, err
 	}
 	return h, nil
 }
