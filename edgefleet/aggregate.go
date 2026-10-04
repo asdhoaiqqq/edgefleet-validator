@@ -105,11 +105,13 @@ type windowState struct {
 // Fatal record problems return *InputError; results already written to out
 // stay written, and open windows are not flushed at end of input.
 //
-// A read failure is distinct from reaching the end of input. At clean
-// io.EOF a final record that arrived without a trailing newline is still
-// processed (and a damaged one is an *InputError carrying its physical line
-// number). When r returns any other error after delivering bytes, only
-// records whose newline was already received are processed, in order,
+// A read failure is distinct from reaching the end of input. Only a reader
+// returning the bare io.EOF sentinel is a clean end, where a final record that
+// arrived without a trailing newline is still processed (and a damaged one is
+// an *InputError carrying its physical line number). A wrapped io.EOF or a
+// combined error whose chain merely contains io.EOF is still a read failure.
+// When r returns any error other than the bare io.EOF after delivering bytes,
+// only records whose newline was already received are processed, in order,
 // including records returned by the same Read that carried the error; the
 // remaining unterminated bytes never become an event, watermark or idle
 // declaration and can produce no late notice or window result, and the
@@ -238,9 +240,11 @@ var errAggregateBadReadCount = errors.New("aggregate reader returned an impossib
 // readAggregateLines feeds newline-delimited physical lines from r to handle,
 // counting every line (a bare "\n" is a blank line too) and stripping a single
 // trailing '\r' so CRLF input works as before. Clean end of input and a
-// non-EOF read failure are handled differently: at clean io.EOF a final line
-// missing its newline is still delivered, exactly like every other final
-// record; after a non-EOF read error only lines whose newline was already
+// non-EOF read failure are handled differently: only the bare io.EOF
+// sentinel is a clean end, and then a final line missing its newline is still
+// delivered, exactly like every other final record; a wrapped io.EOF or a
+// combined error whose chain contains io.EOF is a failure, not an end. After
+// any error other than the bare io.EOF only lines whose newline was already
 // received (including those delivered by the same Read that carried the
 // error) are handled, in order, and then the reader's original error is
 // returned. The unterminated tail never reaches handle, so a read failure
@@ -303,10 +307,13 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 			start += i + 1
 		}
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
+			if readErr == io.EOF {
 				// Clean end of input: a trailing line without a newline is a
 				// complete final record; an empty tail (input ending exactly
-				// on '\n') is nothing, not an extra blank line.
+				// on '\n') is nothing, not an extra blank line. Only the
+				// bare io.EOF sentinel counts -- a wrapped EOF or a combined
+				// error whose chain contains io.EOF is a read failure, never
+				// a clean end.
 				if end > start {
 					if err := deliver(buf[start:end]); err != nil {
 						return err

@@ -133,6 +133,168 @@ func TestReadAggregateLinesEOFVsReadError(t *testing.T) {
 	})
 }
 
+// combinedEOFFailure is a combined error whose chain contains io.EOF
+// alongside a distinct failure cause, as some readers (multiplexed streams,
+// wrapped connections) report when an upstream failure coincides with the
+// local end. errors.Is matches both, but it is not a clean end.
+type combinedEOFFailure struct {
+	cause error
+}
+
+func (e *combinedEOFFailure) Error() string { return "read failure at end: " + e.cause.Error() }
+func (e *combinedEOFFailure) Unwrap() []error {
+	return []error{io.EOF, e.cause}
+}
+
+// wrappedEOF is io.EOF carried in a fmt %w wrapper.
+func wrappedEOF() error { return fmt.Errorf("connection reset at end: %w", io.EOF) }
+
+// TestReadAggregateLinesBareEOFOnly: the end-of-input rule must accept only
+// the bare io.EOF sentinel. A wrapped io.EOF and a combined error containing
+// io.EOF are read failures: the unterminated tail is dropped and the reader's
+// own error is returned with its chain intact.
+func TestReadAggregateLinesBareEOFOnly(t *testing.T) {
+	t.Run("wrapped io.EOF is a failure and drops the tail", func(t *testing.T) {
+		input := "first\nsecond\ntail-without-newline"
+		readErr := wrappedEOF()
+		got, err := collectLines(t, &failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: readErr, errOnBoundary: true,
+		})
+		if err != readErr {
+			t.Fatalf("error = %v, want the reader's original error unchanged", err)
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("wrapped error must stay reachable via errors.Is: %v", err)
+		}
+		want := []collectedLine{{"first", 1}, {"second", 2}}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("lines = %v, want only newline-terminated lines %v", got, want)
+		}
+	})
+	t.Run("combined error containing io.EOF is a failure and drops the tail", func(t *testing.T) {
+		input := "first\nsecond\ntail-without-newline"
+		readErr := &combinedEOFFailure{cause: errSentinelChunkedRead}
+		got, err := collectLines(t, &failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: readErr, errOnBoundary: true,
+		})
+		if err != readErr {
+			t.Fatalf("error = %v, want the reader's original combined error unchanged", err)
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("errors.Is must still follow the chain to io.EOF: %v", err)
+		}
+		if !errors.Is(err, errSentinelChunkedRead) {
+			t.Fatalf("errors.Is must reach the actual failure cause: %v", err)
+		}
+		want := []collectedLine{{"first", 1}, {"second", 2}}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("lines = %v, want only newline-terminated lines %v", got, want)
+		}
+	})
+	t.Run("combined error still completes co-delivered newline lines", func(t *testing.T) {
+		input := strings.Join([]string{
+			`{"type":"event","key":"k","time":100,"value":2}`,
+			`{"type":"watermark","time":1000}`,
+			`{"type":"event","key":"k","time":900,"value":3}`, // unterminated tail
+		}, "\n")
+		readErr := &combinedEOFFailure{cause: errSentinelChunkedRead}
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: readErr, errOnBoundary: true,
+		}, 1000, &out, &late)
+		if err != readErr {
+			t.Fatalf("error = %v, want the combined read error unchanged", err)
+		}
+		wantWindow := `{"key":"k","start":0,"end":1000,"count":1,"sum":2}` + "\n"
+		if out.String() != wantWindow {
+			t.Fatalf("the newline-terminated watermark must close the window first:\n got: %q\nwant: %q", out.String(), wantWindow)
+		}
+		if late.String() != "" {
+			t.Fatalf("unterminated tail must not produce late notices: %q", late.String())
+		}
+	})
+}
+
+// TestReadAggregateCombinedEOFScenario is the exact scenario from the fix
+// report: length-1000 window, a newline-terminated event key=k time=100
+// value=2, then a time=1000 watermark without a newline. A combined error
+// carrying io.EOF and a read failure must fail without emitting [0,1000) and
+// without reporting the tail as a JSON error. The same bytes at a real clean
+// EOF must still produce count 1, sum 2.
+func TestReadAggregateCombinedEOFScenario(t *testing.T) {
+	event := `{"type":"event","key":"k","time":100,"value":2}` + "\n"
+	watermark := `{"type":"watermark","time":1000}`
+
+	t.Run("combined EOF failure emits nothing", func(t *testing.T) {
+		for _, tail := range []string{
+			watermark,                          // complete-looking JSON, no newline
+			`{"type":"watermark","time":1000`,  // truncated
+			`{`,                                // obviously damaged
+		} {
+			tail := tail
+			t.Run("", func(t *testing.T) {
+				input := event + tail
+				readErr := &combinedEOFFailure{cause: errSentinelChunkedRead}
+				var out, late bytes.Buffer
+				err := RunAggregate(&failingAfterReader{
+					data: []byte(input), failAt: len(input),
+					err: readErr, errOnBoundary: true,
+				}, 1000, &out, &late)
+				if err != readErr {
+					t.Fatalf("error = %v, want the combined read error unchanged", err)
+				}
+				if !errors.Is(err, errSentinelChunkedRead) {
+					t.Fatalf("errors.Is must find the read failure cause: %v", err)
+				}
+				if _, ok := err.(*InputError); ok {
+					t.Fatalf("the tail must not be reported as a JSON error: %v", err)
+				}
+				if out.String() != "" {
+					t.Fatalf("no window may close on the unterminated watermark: %q", out.String())
+				}
+				if late.String() != "" {
+					t.Fatalf("no late notices allowed: %q", late.String())
+				}
+			})
+		}
+	})
+	t.Run("wrapped EOF failure emits nothing", func(t *testing.T) {
+		input := event + watermark
+		readErr := wrappedEOF()
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: readErr, errOnBoundary: true,
+		}, 1000, &out, &late)
+		if err != readErr {
+			t.Fatalf("error = %v, want the wrapped error unchanged", err)
+		}
+		if _, ok := err.(*InputError); ok {
+			t.Fatalf("wrapped EOF is a read failure, not an input error: %v", err)
+		}
+		if out.String() != "" {
+			t.Fatalf("wrapped EOF must not close the window: %q", out.String())
+		}
+	})
+	t.Run("same bytes at bare io.EOF produce count 1 sum 2", func(t *testing.T) {
+		input := event + watermark
+		var out, late bytes.Buffer
+		if err := RunAggregate(strings.NewReader(input), 1000, &out, &late); err != nil {
+			t.Fatalf("clean EOF must succeed: %v", err)
+		}
+		want := `{"key":"k","start":0,"end":1000,"count":1,"sum":2}` + "\n"
+		if out.String() != want {
+			t.Fatalf("clean EOF output:\n got: %q\nwant: %q", out.String(), want)
+		}
+		if late.String() != "" {
+			t.Fatalf("unexpected late notices: %q", late.String())
+		}
+	})
+}
+
 // TestReadAggregateErrorUnterminatedTailIsNotARecord drives the exact scenario
 // from the fix: length-1000 windows, event key=k time=100 value=2 with a
 // newline, then a time=1000 watermark JSON without a newline, and the reader
