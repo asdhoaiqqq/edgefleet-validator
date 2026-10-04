@@ -528,33 +528,26 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 		if s.watermark != nil && next < *s.watermark {
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, next)}
 		}
-		s.watermark = &next
-	} else {
-		resuming := s.idle[p]
-		if resuming {
-			// A resume watermark must be at least the partition's previous
-			// watermark and the effective watermark produced while it was
-			// idle; equality on either boundary resumes.
-			if prev, ok := s.partWatermark[p]; ok && next < *prev {
-				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below its previous watermark %d", next, p, *prev)}
-			}
-			if s.watermark != nil && next < *s.watermark {
-				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below the current effective watermark %d", next, p, *s.watermark)}
-			}
-			delete(s.idle, p)
-		} else if prev, ok := s.partWatermark[p]; ok && next < *prev {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
-		}
-		s.partWatermark[p] = &next
-		if effective := s.effectiveWatermark(); effective != nil {
-			s.watermark = effective
-		}
+		return s.advanceAndClose(&next, lineNo)
 	}
 
-	if s.watermark == nil {
-		return nil
+	resuming := s.idle[p]
+	if resuming {
+		// A resume watermark must be at least the partition's previous
+		// watermark and the effective watermark produced while it was
+		// idle; equality on either boundary resumes.
+		if prev, ok := s.partWatermark[p]; ok && next < *prev {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below its previous watermark %d", next, p, *prev)}
+		}
+		if s.watermark != nil && next < *s.watermark {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below the current effective watermark %d", next, p, *s.watermark)}
+		}
+		delete(s.idle, p)
+	} else if prev, ok := s.partWatermark[p]; ok && next < *prev {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
 	}
-	return s.closeWindows(*s.watermark, lineNo)
+	s.partWatermark[p] = &next
+	return s.advanceAndClose(s.effectiveWatermark(), lineNo)
 }
 
 // processIdle declares a partition idle: it stops contributing to the
@@ -568,14 +561,35 @@ func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int)
 	wasIdle := s.idle[p]
 	s.idle[p] = true
 
-	// Recompute the effective watermark. With the partition excluded, the
-	// remaining non-idle partitions determine it; if every partition is idle
-	// the last produced effective watermark is retained instead of clearing.
-	// Repeated idle declarations do not change the state of the windows.
+	// Excluding the partition changes which partitions determine the
+	// effective watermark; recompute it from the new state. A repeated idle
+	// declaration changes nothing, so there is nothing new to determine and
+	// the shared tail simply re-runs closure against the retained watermark
+	// (already-closed windows are gone from the map, so nothing is emitted
+	// twice).
+	var effective *int64
 	if !wasIdle {
-		if next := s.effectiveWatermark(); next != nil {
-			s.watermark = next
-		}
+		effective = s.effectiveWatermark()
+	}
+	return s.advanceAndClose(effective, lineNo)
+}
+
+// advanceAndClose is the shared tail of the two records that can move the
+// watermark: a per-partition watermark update and an idle declaration. The
+// caller first applies its partition-state change and then hands in the
+// overall watermark determined from the resulting state -- the record's own
+// time in single-watermark mode, or the minimum over the active partitions
+// via effectiveWatermark. A nil candidate means no overall watermark can be
+// determined yet (an active partition has not reported) or nothing changed
+// (a repeated idle declaration); the last produced overall watermark is then
+// retained: it is neither cleared nor treated as infinite, so all-idle
+// inputs neither lose nor spuriously close windows. With no overall
+// watermark known nothing closes; otherwise every window whose end is at or
+// below it is emitted through the single shared closure path, attributed to
+// the physical line that triggered the advance.
+func (s *aggregateState) advanceAndClose(effective *int64, lineNo int) error {
+	if effective != nil {
+		s.watermark = effective
 	}
 	if s.watermark == nil {
 		return nil
