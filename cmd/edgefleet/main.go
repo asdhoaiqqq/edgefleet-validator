@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -180,22 +181,30 @@ func runAggregate(args []string) int {
 		fs.Usage()
 		return 2
 	}
-	if *windowMillis <= 0 {
-		fmt.Fprintf(os.Stderr, "aggregate --window-ms must be a positive signed 64-bit integer, got %d\n", *windowMillis)
+	// An omitted --slide-ms defaults to the window length (fixed windows).
+	// This is an omission policy specific to the command: an explicitly given
+	// zero is left untouched, so it is still rejected below rather than being
+	// silently treated as the default.
+	if !slideSpecified {
+		*slideMillis = *windowMillis
+	}
+	// The numeric limits are shared with the library entry points and live in
+	// edgefleet.ValidateAggregateParams; only the flag-named wording and exit
+	// code are command-specific. The shared report order (window, slide,
+	// slide-vs-window, partitions) is the order this command already used.
+	if err := edgefleet.ValidateAggregateParams(*windowMillis, *slideMillis, *partitions); err != nil {
+		var paramErr *edgefleet.AggregateParamError
+		if errors.As(err, &paramErr) {
+			fmt.Fprint(os.Stderr, aggregateParamCLIError(paramErr))
+		} else {
+			fmt.Fprintln(os.Stderr, "aggregate:", err)
+		}
 		return 2
 	}
-	if slideSpecified {
-		if *slideMillis <= 0 {
-			fmt.Fprintf(os.Stderr, "aggregate --slide-ms must be a positive signed 64-bit integer, got %d\n", *slideMillis)
-			return 2
-		}
-		if *slideMillis > *windowMillis {
-			fmt.Fprintf(os.Stderr, "aggregate --slide-ms %d must not exceed --window-ms %d\n", *slideMillis, *windowMillis)
-			return 2
-		}
-	} else {
-		*slideMillis = *windowMillis // omitted: non-overlapping fixed windows
-	}
+	// The command rejects an explicitly supplied non-positive --partitions;
+	// the library accepts zero as its legacy single-watermark mode selector.
+	// The shared validator already rejected negative counts, so here this only
+	// catches an explicit zero, kept as the command's own policy.
 	if partitionsSpecified && *partitions <= 0 {
 		fmt.Fprintf(os.Stderr, "aggregate --partitions must be a positive signed 64-bit integer, got %d\n", *partitions)
 		return 2
@@ -211,6 +220,27 @@ func runAggregate(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// aggregateParamCLIError renders a shared *edgefleet.AggregateParamError in
+// the command's existing flag-named wording. The limit and its checking order
+// come from edgefleet.ValidateAggregateParams; only this text and the exit
+// code are command-specific.
+func aggregateParamCLIError(e *edgefleet.AggregateParamError) string {
+	switch e.Kind {
+	case edgefleet.AggregateParamTooLarge:
+		return fmt.Sprintf("aggregate --slide-ms %d must not exceed --window-ms %d\n", e.Value, e.Limit)
+	case edgefleet.AggregateParamNotPositive:
+		switch e.Field {
+		case edgefleet.AggregateParamWindow:
+			return fmt.Sprintf("aggregate --window-ms must be a positive signed 64-bit integer, got %d\n", e.Value)
+		case edgefleet.AggregateParamSlide:
+			return fmt.Sprintf("aggregate --slide-ms must be a positive signed 64-bit integer, got %d\n", e.Value)
+		case edgefleet.AggregateParamPartitions:
+			return fmt.Sprintf("aggregate --partitions must be a positive signed 64-bit integer, got %d\n", e.Value)
+		}
+	}
+	return fmt.Sprintf("aggregate: invalid %s parameter %d\n", e.Field, e.Value)
 }
 
 func runDemo() {

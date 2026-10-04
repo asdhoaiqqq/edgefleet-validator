@@ -72,6 +72,97 @@ func writeFull(w io.Writer, p []byte) error {
 	return nil
 }
 
+// AggregateParamName identifies which aggregate start parameter a
+// *AggregateParamError reports.
+type AggregateParamName string
+
+const (
+	// AggregateParamWindow is the window length (--window-ms).
+	AggregateParamWindow AggregateParamName = "window"
+	// AggregateParamSlide is the slide interval (--slide-ms).
+	AggregateParamSlide AggregateParamName = "slide"
+	// AggregateParamPartitions is the partition count (--partitions).
+	AggregateParamPartitions AggregateParamName = "partitions"
+)
+
+// AggregateParamKind classifies the problem ValidateAggregateParams found with
+// one parameter.
+type AggregateParamKind string
+
+const (
+	// AggregateParamNotPositive means the value was zero or negative where a
+	// positive signed 64-bit integer is required.
+	AggregateParamNotPositive AggregateParamKind = "not_positive"
+	// AggregateParamTooLarge means the slide interval exceeds the window
+	// length. It is reported for AggregateParamSlide and carries the window
+	// length in Limit.
+	AggregateParamTooLarge AggregateParamKind = "too_large"
+)
+
+// AggregateParamError reports one invalid aggregate start parameter. It is the
+// single source of the shared startup parameter limits: every aggregate entry
+// point (the library runners and the command line) funnels its numeric
+// parameter checks through ValidateAggregateParams, so the same restriction is
+// stated in one place. Which parameter may be omitted, and what an omitted or
+// zero value means, is entry-specific and decided by the caller; this reports
+// only the limits common to every entry. Field identifies the parameter, Kind
+// the violated limit, Value the rejected value and Limit the window length for
+// AggregateParamTooLarge (zero otherwise). Error renders the library entry
+// point's existing wording, which callers may rephrase for their own surface
+// while keeping the field-driven decision identical.
+type AggregateParamError struct {
+	Field AggregateParamName
+	Kind  AggregateParamKind
+	Value int64
+	Limit int64
+}
+
+func (e *AggregateParamError) Error() string {
+	switch e.Kind {
+	case AggregateParamTooLarge:
+		return fmt.Sprintf("slide interval %d must not exceed window length %d", e.Value, e.Limit)
+	case AggregateParamNotPositive:
+		switch e.Field {
+		case AggregateParamWindow:
+			return fmt.Sprintf("window length must be a positive signed 64-bit integer, got %d", e.Value)
+		case AggregateParamSlide:
+			return fmt.Sprintf("slide interval must be a positive signed 64-bit integer, got %d", e.Value)
+		case AggregateParamPartitions:
+			return fmt.Sprintf("partition count must be a positive signed 64-bit integer, got %d", e.Value)
+		}
+	}
+	return fmt.Sprintf("invalid aggregate parameter %s: %d", e.Field, e.Value)
+}
+
+// ValidateAggregateParams enforces the aggregate startup limits shared by every
+// entry point, in the order they have always been reported: window length,
+// then slide interval, then the slide-vs-window comparison, then the partition
+// count. windowMillis must be a positive signed 64-bit integer. slideMillis
+// must be a positive signed 64-bit integer no greater than windowMillis; it
+// does not have to divide windowMillis, and equality is the fixed-window case.
+// partitions must not be negative; zero itself is accepted here because the
+// library entry points use it to select legacy single-watermark mode -- an
+// entry that rejects an explicitly supplied zero (the command line) keeps that
+// policy of its own before or around this call. The first violated limit is
+// returned as *AggregateParamError; nil means the parameters are sound and the
+// caller may start reading input, so no invalid configuration ever reaches the
+// input reader.
+func ValidateAggregateParams(windowMillis, slideMillis, partitions int64) error {
+	if windowMillis <= 0 {
+		return &AggregateParamError{Field: AggregateParamWindow, Kind: AggregateParamNotPositive, Value: windowMillis}
+	}
+	if slideMillis <= 0 {
+		return &AggregateParamError{Field: AggregateParamSlide, Kind: AggregateParamNotPositive, Value: slideMillis}
+	}
+	if slideMillis > windowMillis {
+		return &AggregateParamError{Field: AggregateParamSlide, Kind: AggregateParamTooLarge, Value: slideMillis, Limit: windowMillis}
+	}
+	if partitions < 0 {
+		return &AggregateParamError{Field: AggregateParamPartitions, Kind: AggregateParamNotPositive, Value: partitions}
+	}
+	return nil
+}
+
 type windowID struct {
 	start int64 // inclusive window start in milliseconds since time zero
 	key   string
@@ -194,17 +285,8 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 // overflow checks and end-of-input behavior are otherwise identical to
 // RunAggregateSliding.
 func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
-	if windowMillis <= 0 {
-		return fmt.Errorf("window length must be a positive signed 64-bit integer, got %d", windowMillis)
-	}
-	if slideMillis <= 0 {
-		return fmt.Errorf("slide interval must be a positive signed 64-bit integer, got %d", slideMillis)
-	}
-	if slideMillis > windowMillis {
-		return fmt.Errorf("slide interval %d must not exceed window length %d", slideMillis, windowMillis)
-	}
-	if partitions < 0 {
-		return fmt.Errorf("partition count must be a positive signed 64-bit integer, got %d", partitions)
+	if err := ValidateAggregateParams(windowMillis, slideMillis, partitions); err != nil {
+		return err
 	}
 	s := &aggregateState{
 		windowMillis:  windowMillis,
