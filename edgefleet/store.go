@@ -372,6 +372,28 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
+// mergeRecord applies the single dedup/conflict rule shared by both submit
+// phases (records within the batch, and the batch against stored history): a
+// record's identity is its node id and seq together, and known must contain
+// only records of that same node. If known already holds the identity, the
+// incoming record is a duplicate when Heartbeat.Equal says the content is
+// identical — collection time compared as an instant, node id and version
+// compared as-is — and a conflict when any field differs. A conflict is an
+// error naming the node and seq and changes nothing; a duplicate leaves
+// known untouched and reports dup. Otherwise the record is appended and
+// returned in the updated slice.
+func mergeRecord(known []Heartbeat, r Heartbeat) (updated []Heartbeat, dup bool, err error) {
+	for _, e := range known {
+		if e.Seq == r.Seq {
+			if !e.Equal(r) {
+				return nil, false, fmt.Errorf("conflicting record for node %q seq %d: content differs", r.NodeID, r.Seq)
+			}
+			return known, true, nil
+		}
+	}
+	return append(known, r), false, nil
+}
+
 // Submit persists a batch of heartbeats. The whole batch is validated and
 // checked for duplicates/conflicts against stored data (and within the batch)
 // before anything is written: a single invalid or conflicting record fails
@@ -394,26 +416,19 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 	}
 	defer unlock()
 
-	// Deduplicate within the batch: same node+seq with equal fields counts
+	// Deduplicate within the batch: same node+seq with equal content counts
 	// as a duplicate; same node+seq with differing content is a conflict.
 	merged := make(map[string][]Heartbeat)
 	for _, r := range records {
-		list := merged[r.NodeID]
-		found := -1
-		for i, e := range list {
-			if e.Seq == r.Seq {
-				found = i
-				break
-			}
+		list, dup, err := mergeRecord(merged[r.NodeID], r)
+		if err != nil {
+			return 0, 0, err
 		}
-		if found >= 0 {
-			if !list[found].Equal(r) {
-				return 0, 0, fmt.Errorf("conflicting records for node %q seq %d in batch: content differs", r.NodeID, r.Seq)
-			}
+		if dup {
 			dupCount++
 			continue
 		}
-		merged[r.NodeID] = append(list, r)
+		merged[r.NodeID] = list
 	}
 
 	// Merge with stored data per node, collecting new file contents.
@@ -433,22 +448,16 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 			existing = nf.Records
 		}
 		for _, r := range batch {
-			found := -1
-			for i, e := range existing {
-				if e.Seq == r.Seq {
-					found = i
-					break
-				}
+			var dup bool
+			existing, dup, err = mergeRecord(existing, r)
+			if err != nil {
+				return 0, 0, err
 			}
-			if found >= 0 {
-				if !existing[found].Equal(r) {
-					return 0, 0, fmt.Errorf("conflicting record for node %q seq %d: content differs from stored record", nodeID, r.Seq)
-				}
+			if dup {
 				dupCount++
-				continue
+			} else {
+				newCount++
 			}
-			existing = append(existing, r)
-			newCount++
 		}
 		sort.Slice(existing, func(i, j int) bool { return existing[i].Seq < existing[j].Seq })
 		updates = append(updates, update{path: path, records: existing})
