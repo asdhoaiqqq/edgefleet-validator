@@ -373,7 +373,8 @@ func writeFileAtomic(path string, data []byte) error {
 }
 
 // Submit persists a batch of heartbeats. The whole batch is validated and
-// checked for duplicates/conflicts against stored data (and within the batch)
+// checked for duplicates/conflicts — within the batch (foldBatch) and against
+// stored data (mergeFolded), both driven by the same identity/Equal rule —
 // before anything is written: a single invalid or conflicting record fails
 // the batch with no changes. Duplicates are counted, not written. A
 // successful return means the batch was durably persisted; a persistence
@@ -394,70 +395,49 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 	}
 	defer unlock()
 
-	// Deduplicate within the batch: same node+seq with equal fields counts
-	// as a duplicate; same node+seq with differing content is a conflict.
-	merged := make(map[string][]Heartbeat)
-	for _, r := range records {
-		list := merged[r.NodeID]
-		found := -1
-		for i, e := range list {
-			if e.Seq == r.Seq {
-				found = i
-				break
-			}
-		}
-		if found >= 0 {
-			if !list[found].Equal(r) {
-				return 0, 0, fmt.Errorf("conflicting records for node %q seq %d in batch: content differs", r.NodeID, r.Seq)
-			}
-			dupCount++
-			continue
-		}
-		merged[r.NodeID] = append(list, r)
+	// Phase 1 (batch-internal rule) runs before any stored file is read: a
+	// batch contradicting itself is rejected on those grounds even when a
+	// different touched node has corrupt history.
+	folded, err := foldBatch(records)
+	if err != nil {
+		return 0, 0, err
 	}
 
-	// Merge with stored data per node, collecting new file contents.
-	type update struct {
-		path    string
-		records []Heartbeat
-	}
-	var updates []update
-	for nodeID, batch := range merged {
-		path := s.nodePath(nodeID)
-		nf, err := loadNodeFile(path)
+	// Load the current history of every node the batch touches. Any failure
+	// here is reported before a merge is computed, so the batch never writes
+	// alongside corrupt or misowned data.
+	history := make(map[string][]Heartbeat)
+	for _, r := range records {
+		if _, ok := history[r.NodeID]; ok {
+			continue
+		}
+		nf, err := loadNodeFile(s.nodePath(r.NodeID))
 		if err != nil {
 			return 0, 0, err
 		}
-		existing := []Heartbeat{}
 		if nf != nil {
-			existing = nf.Records
+			history[r.NodeID] = nf.Records
 		}
-		for _, r := range batch {
-			found := -1
-			for i, e := range existing {
-				if e.Seq == r.Seq {
-					found = i
-					break
-				}
-			}
-			if found >= 0 {
-				if !existing[found].Equal(r) {
-					return 0, 0, fmt.Errorf("conflicting record for node %q seq %d: content differs from stored record", nodeID, r.Seq)
-				}
-				dupCount++
-				continue
-			}
-			existing = append(existing, r)
-			newCount++
-		}
-		sort.Slice(existing, func(i, j int) bool { return existing[i].Seq < existing[j].Seq })
-		updates = append(updates, update{path: path, records: existing})
 	}
 
-	// Persist. All updates are appends to previously verified data, so a
-	// failure here leaves every previously queryable record intact.
-	for _, u := range updates {
-		if err := writeNodeFile(u.path, u.records); err != nil {
+	// Phase 2 (against-history rule) uses the same identity and Equal
+	// primitives as phase 1.
+	merged, newCount, dupCount, err := mergeFolded(folded, history)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Persist the merged history of every node the batch touched. A node
+	// whose batch was all duplicates is rewritten with identical content.
+	// All updates are appends to previously verified data, so a failure here
+	// leaves every previously queryable record intact.
+	touched := make([]string, 0, len(merged))
+	for nodeID := range merged {
+		touched = append(touched, nodeID)
+	}
+	sort.Strings(touched)
+	for _, nodeID := range touched {
+		if err := writeNodeFile(s.nodePath(nodeID), merged[nodeID]); err != nil {
 			return 0, 0, fmt.Errorf("failed to persist heartbeat batch: %w", err)
 		}
 	}
