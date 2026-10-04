@@ -629,3 +629,121 @@ func TestCLIMisownedNodeFileIsRefused(t *testing.T) {
 		t.Errorf("real owner must still query normally: code=%d out=%q", code, out)
 	}
 }
+
+// TestCLISubmitRejectsLossyNodeID exercises the user-visible contract for the
+// identity fix: a node value carrying invalid UTF-8 bytes or an unpaired
+// Unicode surrogate must fail the whole submit — non-zero exit, the error on
+// stderr locating the record and the node field, and no "submitted" success
+// statistics on stdout. Valid records elsewhere in the same batch are not
+// saved either, and later health queries are unchanged.
+func TestCLISubmitRejectsLossyNodeID(t *testing.T) {
+	f := newFixture(t)
+
+	const objTail = `"seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}`
+	cases := []struct {
+		name      string
+		nodeValue string // raw JSON node value including quotes
+	}{
+		{"invalid utf8 bytes", `"bad` + "\xff" + `"`},
+		{"unpaired high surrogate", `"\ud800"`},
+		{"unpaired low surrogate", `"\ude00"`},
+		{"surrogate pair not closed", `"n😀\ud83d"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			monoBefore := readNodeFile(t, f.dir, "mono")
+			batch := `[
+			  {"node":` + tc.nodeValue + `,` + objTail + `,
+			  {"node":"brandnew",` + objTail + `,
+			  {"node":"mono","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":104,"missed":15}
+			]`
+			out, errOut, code := runCLI(t, f.dir, batch,
+				"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+			if code == 0 {
+				t.Errorf("lossy node batch must exit non-zero; stdout=%q stderr=%q", out, errOut)
+			}
+			if strings.Contains(out, "submitted") {
+				t.Errorf("rejected batch must not print success statistics, stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("rejected batch must print nothing on stdout, got %q", out)
+			}
+			if !strings.Contains(errOut, "error:") ||
+				!strings.Contains(errOut, "record 1") || !strings.Contains(errOut, "node") {
+				t.Errorf("stderr must locate record 1 and the node field, got %q", errOut)
+			}
+
+			// Neither the first-time node nor the new mono record was saved.
+			if _, err := os.Stat(nodeFileHexPath(f.dir, "brandnew")); !os.IsNotExist(err) {
+				t.Errorf("brand-new node file must not be created, stat err=%v", err)
+			}
+			if got := readNodeFile(t, f.dir, "mono"); got != monoBefore {
+				t.Errorf("existing node file was rewritten during the rejected batch")
+			}
+			// A health query under the same conditions is unchanged.
+			out, _, code = health(t, f,
+				"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "9")
+			if code != 0 || !strings.Contains(out, "seq=3") {
+				t.Errorf("mono health must be unchanged: code=%d out=%q", code, out)
+			}
+		})
+	}
+}
+
+// TestCLILosslessUnicodeNodeIDsSubmitAndQuery verifies ordinary legal Unicode
+// ids keep working end to end: Chinese text, spaces, slashes, an astral
+// character supplied either literally or as a paired surrogate, and an
+// explicitly entered U+FFFD. The same id text expressed both ways is one
+// node (the second heartbeat is a duplicate of the first), while two
+// genuinely different ids stay separate nodes.
+func TestCLILosslessUnicodeNodeIDsSubmitAndQuery(t *testing.T) {
+	f := newFixture(t)
+
+	batch := `[
+	  {"node":"节点/甲","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":11,"missed":0},
+	  {"node":"edge node 1","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":22,"missed":0},
+	  {"node":"emoji😀node","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":33,"missed":0},
+	  {"node":"explicit�","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":44,"missed":0}
+	]`
+	if out, errOut, code := runCLI(t, f.dir, batch,
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt); code != 0 {
+		t.Fatalf("legal unicode node ids must submit: code=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+
+	// Resubmitting the emoji id written as a correct surrogate-pair escape
+	// with the same content counts as a duplicate, not a new node.
+	dup := `[{"node":"emoji\ud83d\ude00node","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":33,"missed":0}]`
+	out, errOut, code := runCLI(t, f.dir, dup,
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+	if code != 0 {
+		t.Fatalf("escaped spelling of the same id must submit: code=%d stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "new=0") || !strings.Contains(out, "duplicate=1") {
+		t.Errorf("escaped spelling of an existing id must be a duplicate, got %q", out)
+	}
+
+	for _, tc := range []struct {
+		node   string
+		height string
+	}{
+		{"节点/甲", "height=11"},
+		{"edge node 1", "height=22"},
+		{"emoji😀node", "height=33"},
+		{"explicit�", "height=44"},
+	} {
+		out, _, code := health(t, f,
+			"--node", tc.node, "--expected-version", "1.26.0", "--tolerated-misses", "0")
+		if code != 0 {
+			t.Errorf("health for %q must succeed", tc.node)
+			continue
+		}
+		if !strings.Contains(out, "node="+tc.node) || !strings.Contains(out, tc.height) {
+			t.Errorf("health for %q must keep the original id and data, got %q", tc.node, out)
+		}
+		out, _, code = runCLI(t, f.dir, "",
+			"heartbeat", "history", "--data-dir", f.dir, "--node", tc.node)
+		if code != 0 || !strings.Contains(out, "node="+tc.node) {
+			t.Errorf("history for %q broken: code=%d out=%q", tc.node, code, out)
+		}
+	}
+}

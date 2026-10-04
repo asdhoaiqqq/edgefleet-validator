@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // Heartbeat is one telemetry record reported by a node.
@@ -35,6 +36,16 @@ var heartbeatFields = []string{"node", "seq", "collected_at", "version", "height
 func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
 	if h.NodeID == "" {
 		return fmt.Errorf("node id is empty")
+	}
+	if !utf8.ValidString(h.NodeID) {
+		// The platform distinguishes nodes by their id exactly as given. A
+		// string with invalid UTF-8 bytes cannot be represented losslessly —
+		// encoding/json replaces each bad byte with U+FFFD when saving, so
+		// different inputs would collapse onto one node file and later reads
+		// would report different ownership than the submit accepted. Reject
+		// such an id instead of accepting a rewritten identity. A U+FFFD the
+		// caller put there on purpose is valid UTF-8 and stays accepted.
+		return fmt.Errorf("node id is not valid UTF-8 text")
 	}
 	if h.Seq <= 0 {
 		return fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
@@ -102,6 +113,89 @@ func rejectNull(raw json.RawMessage, field string) error {
 	return nil
 }
 
+// validateNodeJSON validates the raw JSON string value of the "node" field
+// before it is decoded, because encoding/json does not enforce this itself:
+// it silently rewrites invalid UTF-8 bytes and unpaired \uD800–\uDFFF
+// surrogate escapes into the replacement rune U+FFFD. That rewrite is not
+// lossless — different inputs decode to the same Go string and land on the
+// same per-node file, so the platform can no longer tell the nodes apart.
+// Both forms are therefore rejected at the trust boundary instead.
+//
+// A correctly paired surrogate (😀) denotes one astral character
+// and is accepted, as is every ordinary literal character (Chinese text,
+// spaces, slashes). A U+FFFD the user actually wrote — literally or as
+// \uFFFD — is legitimate input and is accepted too; only bytes/escapes
+// that force a substitution are refused.
+func validateNodeJSON(raw json.RawMessage) error {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		// Not a JSON string; the subsequent json.Unmarshal reports the type
+		// error with the usual message.
+		return nil
+	}
+	body := raw[1 : len(raw)-1]
+	if !utf8.Valid(body) {
+		return fmt.Errorf("node contains invalid UTF-8 bytes and cannot be represented losslessly")
+	}
+	// Surrogates pair only when the two \uXXXX escapes are adjacent, exactly
+	// as the JSON grammar and encoding/json require: a high surrogate followed
+	// by any other character or escape (even another \u escape) leaves it
+	// unpaired and is replaced by U+FFFD on decode.
+	for i := 0; i < len(body); {
+		if body[i] != '\\' {
+			i++
+			continue
+		}
+		if i+1 >= len(body) || body[i+1] != 'u' {
+			// Two-character escape such as \" or \\; any malformed escape is
+			// left for the regular JSON decoder to reject.
+			i += 2
+			continue
+		}
+		r, ok := parseHex4Escape(body[i:])
+		if !ok {
+			return nil // malformed \u escape; json.Unmarshal reports the syntax error
+		}
+		switch {
+		case r >= 0xD800 && r <= 0xDBFF:
+			low, ok := parseHex4Escape(body[i+6:])
+			if !ok || low < 0xDC00 || low > 0xDFFF {
+				return fmt.Errorf("node contains an unpaired high surrogate in a Unicode escape")
+			}
+			i += 12 // consume the high-low pair as one astral character
+		case r >= 0xDC00 && r <= 0xDFFF:
+			return fmt.Errorf("node contains an unpaired low surrogate in a Unicode escape")
+		default:
+			i += 6
+		}
+	}
+	return nil
+}
+
+// parseHex4Escape decodes the four hex digits of a \uXXXX escape. s starts at
+// the backslash. ok is false for anything other than a well-formed escape, in
+// which case the regular JSON decoder owns the resulting syntax error.
+func parseHex4Escape(s []byte) (rune, bool) {
+	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+		return 0, false
+	}
+	var r rune
+	for _, c := range s[2:6] {
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'f':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			v = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		r = r<<4 | rune(v)
+	}
+	return r, true
+}
+
 // decodeStrictHeartbeatObject converts one JSON object's raw bytes into a
 // Heartbeat while enforcing the field rules at every trust boundary: all
 // fields must be present and non-null, unknown fields are rejected, and a
@@ -162,6 +256,9 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	var h Heartbeat
 
 	if err := rejectNull(fields["node"], "node"); err != nil {
+		return Heartbeat{}, err
+	}
+	if err := validateNodeJSON(fields["node"]); err != nil {
 		return Heartbeat{}, err
 	}
 	if err := json.Unmarshal(fields["node"], &h.NodeID); err != nil {
