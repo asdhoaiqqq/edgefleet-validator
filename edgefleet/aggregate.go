@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // AggregateResult is one closed window output line.
@@ -103,7 +105,17 @@ type windowState struct {
 // still-open windows produce no further results; content already accepted
 // by the writers stays in place, including fully written earlier results.
 // Fatal record problems return *InputError; results already written to out
-// stay written, and open windows are not flushed at end of input.
+// stay written, and open windows are not flushed at end of input. An event
+// key with damaged character encoding -- an invalid UTF-8 byte sequence, or a
+// \u escape containing a high surrogate not followed by a low surrogate (or a
+// low surrogate on its own) -- is one such fatal record problem, reported
+// with the key's physical line: the bytes are never patched to U+FFFD, so
+// distinct damaged inputs cannot merge with each other or with a key that
+// genuinely contains U+FFFD. A literal U+FFFD (typed directly or as "\uFFFD"),
+// a correctly paired surrogate pair and an escaped backslash ("\\uD800" is
+// plain text) are all valid keys. The damaged event changes no window count
+// or sum, is fatal even when its event time is below the current watermark
+// (it is not merely logged late), and no later records are processed.
 //
 // A read failure is distinct from reaching the end of input. Only a reader
 // returning the bare io.EOF sentinel is a clean end, where a final record that
@@ -443,7 +455,7 @@ func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
 }
 
 func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
-	key, err := requiredString(obj, "key", lineNo)
+	key, err := requiredKey(obj, lineNo)
 	if err != nil {
 		return err
 	}
@@ -686,14 +698,25 @@ func (s *aggregateState) closeWindows(watermark int64, lineNo int) error {
 	return nil
 }
 
-func requiredString(obj map[string]json.RawMessage, field string, lineNo int) (string, error) {
-	raw, ok := obj[field]
+// requiredKey decodes the event record's "key" field with strict character
+// handling. Unlike other string fields, a key must not hide damaged input
+// behind replacement characters: an invalid UTF-8 byte sequence inside the
+// string, or an orphaned or mismatched surrogate in a \u escape (a high
+// surrogate not followed by a low surrogate, a low surrogate not preceded by
+// a high one), is a fatal *InputError naming the physical line instead of
+// being rewritten to U+FFFD, since silent replacement would merge distinct
+// damaged inputs with each other and with a key that genuinely contains
+// U+FFFD. A real U+FFFD entered directly or as "\uFFFD", a supplementary
+// plane character written as a matched surrogate pair, and a backslash that
+// is itself escaped ("\\uD800" is the literal text \uD800) are all valid.
+func requiredKey(obj map[string]json.RawMessage, lineNo int) (string, error) {
+	raw, ok := obj["key"]
 	if !ok {
-		return "", &InputError{Line: lineNo, Reason: fmt.Sprintf("missing required string field %q", field)}
+		return "", &InputError{Line: lineNo, Reason: `missing required string field "key"`}
 	}
-	value, err := decodeString(raw, field)
+	value, err := decodeKeyStrict(bytes.TrimSpace(raw))
 	if err != nil {
-		return "", &InputError{Line: lineNo, Reason: err.Error()}
+		return "", &InputError{Line: lineNo, Reason: `field "key" ` + err.Error()}
 	}
 	return value, nil
 }
@@ -731,6 +754,162 @@ func decodeString(raw json.RawMessage, field string) (string, error) {
 		return "", fmt.Errorf("field %q must be a JSON string: %v", field, err)
 	}
 	return value, nil
+}
+
+// decodeKeyStrict decodes a single JSON string token the same way
+// json.Unmarshal would, except damage that the standard library quietly
+// rewrites to U+FFFD is rejected: every raw byte between escapes must be a
+// valid UTF-8 sequence, and every \u escape introducing a surrogate must be
+// paired correctly (high 0xD800-0xDBFF immediately followed by low
+// 0xDC00-0xDFFF, which together decode one supplementary-plane rune). A lone
+// half, a low where a high is expected, or a high whose following \u is not a
+// low is an error. A U+FFFD produced by neither kind of damage -- typed
+// directly, written as "�", or reached through a different escape -- is a
+// normal character and stays legal, and "\\uD800" (an escaped backslash
+// followed by plain text) is literal text, not a surrogate escape. raw must
+// contain only the string token, with no surrounding whitespace.
+func decodeKeyStrict(raw []byte) (string, error) {
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", fmt.Errorf("must be a JSON string, got %s", string(raw))
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	i := 1
+	for i < len(raw) {
+		c := raw[i]
+		switch {
+		case c == '"':
+			if i != len(raw)-1 {
+				return "", fmt.Errorf("must be a JSON string: trailing data after closing quote: %s", string(raw))
+			}
+			return b.String(), nil
+		case c == '\\':
+			i++
+			if i >= len(raw) {
+				return "", fmt.Errorf("must be a JSON string: unterminated escape sequence: %s", string(raw))
+			}
+			switch e := raw[i]; e {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				b.WriteByte(escapeMapping[e])
+				i++
+			case 'u':
+				r, size, err := decodeUnicodeEscape(raw, i)
+				if err != nil {
+					return "", err
+				}
+				i += size // i now points just past the fourth hex digit
+				switch {
+				case r >= 0xDC00 && r <= 0xDFFF:
+					// A low surrogate where a rune is expected is orphaned.
+					return "", keyEncodingError(raw, "unpaired low surrogate in Unicode escape")
+				case utf16.IsSurrogate(r):
+					// A high surrogate is legal only when the very next escape
+					// is a low surrogate; anything else -- end of string, a
+					// plain rune, or a non-surrogate escape -- leaves it
+					// orphaned. Room must remain for another "\uXXXX" and the
+					// closing quote.
+					if i+6 >= len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+						return "", keyEncodingError(raw, "unpaired high surrogate in Unicode escape")
+					}
+					low, lowSize, err := decodeUnicodeEscape(raw, i+1)
+					if err != nil {
+						return "", err
+					}
+					if low < 0xDC00 || low > 0xDFFF {
+						return "", keyEncodingError(raw, "unpaired high surrogate in Unicode escape")
+					}
+					r = utf16.DecodeRune(r, low)
+					i += 1 + lowSize // skip the low's backslash and "uXXXX"
+				}
+				var buf [4]byte
+				n := utf8.EncodeRune(buf[:], r)
+				b.Write(buf[:n])
+			default:
+				return "", fmt.Errorf("must be a JSON string: invalid escape %q in %s", string(e), string(raw))
+			}
+		case c < 0x20:
+			return "", fmt.Errorf("must be a JSON string: unescaped control character in %s", string(raw))
+		default:
+			// A run of bytes up to the next backslash, quote or unescaped
+			// control character must be valid UTF-8 as it stands; invalid
+			// bytes must never become U+FFFD. (The outer JSON parse already
+			// rejects control characters; this keeps the decoder sound on its
+			// own.)
+			j := i
+			for j < len(raw) && raw[j] != '"' && raw[j] != '\\' && raw[j] >= 0x20 {
+				j++
+			}
+			if j < len(raw) && raw[j] < 0x20 {
+				return "", fmt.Errorf("must be a JSON string: unescaped control character in %s", string(raw))
+			}
+			chunk := raw[i:j]
+			if !utf8.Valid(chunk) {
+				return "", keyEncodingError(raw, "invalid UTF-8 byte sequence")
+			}
+			b.Write(chunk)
+			i = j
+		}
+	}
+	return "", fmt.Errorf("must be a JSON string: unterminated string: %s", string(raw))
+}
+
+// escapeMapping maps the single-character JSON escapes to the byte they
+// denote; only the table's listed escape letters are ever looked up.
+var escapeMapping = [256]byte{
+	'"':  '"',
+	'\\': '\\',
+	'/':  '/',
+	'b':  '\b',
+	'f':  '\f',
+	'n':  '\n',
+	'r':  '\r',
+	't':  '\t',
+}
+
+// decodeUnicodeEscape parses a "uXXXX" Unicode escape with raw[pos] at its
+// 'u' (the preceding backslash is at pos-1) and returns the 16-bit code unit
+// it denotes and the number of bytes consumed from pos (5 for "uXXXX"). It
+// neither validates nor pairs surrogates: the caller decides whether a high
+// surrogate is followed by a low one and rejects an orphaned half.
+func decodeUnicodeEscape(raw []byte, pos int) (rune, int, error) {
+	if pos+4 >= len(raw) || raw[pos] != 'u' {
+		return 0, 0, keyEncodingError(raw, "incomplete Unicode escape")
+	}
+	v, ok := parseHex4(raw[pos+1 : pos+5])
+	if !ok {
+		return 0, 0, keyEncodingError(raw, "malformed Unicode escape")
+	}
+	return rune(v), 5, nil
+}
+
+// parseHex4 parses exactly four hexadecimal digits.
+func parseHex4(p []byte) (int, bool) {
+	if len(p) < 4 {
+		return 0, false
+	}
+	v := 0
+	for _, c := range p[:4] {
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, true
+}
+
+// keyEncodingError reports that a key's character encoding or Unicode
+// escapes are damaged; the raw token is included for context, quoted through
+// %q which renders non-printable bytes.
+func keyEncodingError(raw []byte, detail string) error {
+	return fmt.Errorf("has damaged character encoding (%s) in %s", detail, string(raw))
 }
 
 func decodeInt64(raw json.RawMessage, field string) (int64, error) {

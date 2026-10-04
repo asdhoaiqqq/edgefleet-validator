@@ -113,6 +113,27 @@ aggregate: line 5: event for idle partition 1 is not allowed; send a watermark t
 
 这两类失败都会报告物理输入行号和原因、停止处理后续记录（上例中第 6 行的水位线不会再被读取），退出码为 1，但此前已输出的窗口结果全部保留。
 
+### 误用三：key 的字符编码损坏
+
+事件 key 按解码后的原值聚合。key 中任何损坏的字符都不会被修补成替换字符 U+FFFD 后继续计数——否则不同的损坏输入会彼此合并，还会和用户真的以“�”为 key 的结果混在一起。两类损坏都会使该事件成为致命输入错误：key 字符串里的非法 UTF-8 字节序列，以及 JSON `\u` 转义中孤立或配对错误的高、低代理项。例如 `"\uD800"`、`"\uDC00"`、`"\uD800x"` 都必须失败：
+
+```bash
+printf '%s\n' \
+  '{"type":"event","key":"sensor-a","time":100,"value":5}' \
+  '{"type":"watermark","time":1000}' \
+  '{"type":"event","key":"x\uDC00","time":200,"value":99}' \
+  | go run ./cmd/edgefleet aggregate --window-ms 1000
+```
+
+```
+{"key":"sensor-a","start":0,"end":1000,"count":1,"sum":5}   # 标准输出
+aggregate: line 3: field "key" has damaged character encoding (unpaired low surrogate in Unicode escape) in "x\uDC00"   # 标准错误
+```
+
+该事件不改变任何窗口的 count 或 sum；即使其事件时间已低于当前水位线，也是输入错误，而不是只写一条迟到提示后继续。处理立即停止，后续记录不再读取，退出码为 1，此前已完整输出的结果保留，尚未关闭的窗口不补发；空行仍计入错误行号。
+
+合法字符不受影响：中文与补充平面字符正常接收，直接输入“😀”与 `"\uD83D\uDE00"` 汇入同一个 key；用户直接输入“�”或使用 `"\uFFFD"` 也是合法字符串，不会因为解码结果含该字符而被拒绝；JSON 里已转义的反斜杠（`"\\uD800"`）只表示字面文本 `\uD800`，按普通文本保留，不会被当成孤立代理项。相同的合法 key 仍合并，不同的合法 key 仍按 UTF-8 字节序各自输出。该规则同样适用于滑动窗口与分区聚合入口。
+
 ## 技术方向
 
 validator, node-monitoring, device-fleet, p2p-network, telemetry, devnet
