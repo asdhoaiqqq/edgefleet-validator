@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -109,9 +110,34 @@ func checksumRecords(records []Heartbeat) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// nodeIDFromPath recovers the node id a store file belongs to from its file
+// name: nodePath writes each node's records to hex(nodeID)+".json", so the
+// owner is exactly the string the base name decodes to. Node ids are compared
+// as the exact strings they are — ids containing Chinese characters, spaces
+// or slashes decode back unchanged and are never normalised or merged.
+func nodeIDFromPath(path string) (string, error) {
+	base := filepath.Base(path)
+	if !strings.HasSuffix(base, ".json") {
+		return "", fmt.Errorf("file name %q is not a per-node heartbeat file", base)
+	}
+	raw, err := hex.DecodeString(strings.TrimSuffix(base, ".json"))
+	if err != nil {
+		return "", fmt.Errorf("file name %q does not encode a node id: %w", base, err)
+	}
+	return string(raw), nil
+}
+
 // loadNodeFile reads and verifies the file for one node. A missing file means
-// the node has no records (returns nil, nil). Any parse, checksum or
-// structural failure is reported as a CorruptError.
+// the node has no records (returns nil, nil). Any parse, checksum, ownership
+// or structural failure is reported as a CorruptError.
+//
+// Ownership: the file belongs to exactly one node — the one encoded in its
+// file name — and every record in it must declare that same node id. A file
+// whose records name another node (for example another node's file copied
+// over this one, format and checksum still intact) is not that node's
+// telemetry: the whole file is refused as corrupt, no matter where the
+// foreign record sits in the history and even if the latest record happens
+// to name the right node.
 //
 // The file is decoded with the same strict rules as submit input: every
 // telemetry field must be present, non-null and written once per record. A
@@ -138,6 +164,17 @@ func loadNodeFile(path string) (*nodeFile, error) {
 	}
 	if got := checksumRecords(nf.Records); got != nf.Checksum {
 		return nil, &CorruptError{Path: path, Err: fmt.Errorf("checksum mismatch: stored %s, computed %s", nf.Checksum, got)}
+	}
+	owner, err := nodeIDFromPath(path)
+	if err != nil {
+		return nil, &CorruptError{Path: path, Err: err}
+	}
+	for i, r := range nf.Records {
+		if r.NodeID != owner {
+			return nil, &CorruptError{Path: path, Err: fmt.Errorf(
+				"record %d: heartbeat declares node %q, but this file belongs to node %q",
+				i+1, r.NodeID, owner)}
+		}
 	}
 	return nf, nil
 }

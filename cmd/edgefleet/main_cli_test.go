@@ -551,3 +551,81 @@ func TestCLISubmitRejectsBatchTouchingCorruptNode(t *testing.T) {
 	}
 	submitBatch(t, f.dir, `[{"node":"gappy","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":304,"missed":4}]`)
 }
+
+// TestCLIMisownedNodeFileIsRefused plants one node's complete, checksum-valid
+// file under another node's name and checks the command line refuses to serve
+// it as the wrong node's telemetry: health (plain and with a baseline),
+// history and submit all fail non-zero with the reason on stderr, while the
+// real owner keeps working.
+func TestCLIMisownedNodeFileIsRefused(t *testing.T) {
+	f := newFixture(t)
+
+	// Copy mono's intact file over gappy's. Format and checksum stay valid;
+	// only the ownership is wrong.
+	corruptNodeFile(t, f.dir, "gappy", readNodeFile(t, f.dir, "mono"))
+	misownedPath := nodeFileHexPath(f.dir, "gappy")
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"health", []string{"--node", "gappy", "--expected-version", "1.26.0", "--tolerated-misses", "9"}},
+		{"health with baseline", []string{"--node", "gappy", "--expected-version", "1.26.0", "--tolerated-misses", "9", "--missed-since-seq", "1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, code := health(t, f, tc.args...)
+			if code == 0 {
+				t.Fatalf("misowned file must fail the query, exit=0 stdout=%q", out)
+			}
+			if out != "" {
+				t.Errorf("no health result may be printed, stdout=%q", out)
+			}
+			for _, want := range []string{misownedPath, "record 1", `"gappy"`, `"mono"`} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr must contain %s, got %q", want, errOut)
+				}
+			}
+		})
+	}
+
+	out, errOut, code := runCLI(t, f.dir, "",
+		"heartbeat", "history", "--data-dir", f.dir, "--node", "gappy")
+	if code == 0 {
+		t.Fatalf("history of a misowned file must fail, exit=0 stdout=%q", out)
+	}
+	if out != "" {
+		t.Errorf("no history may be printed, stdout=%q", out)
+	}
+	if !strings.Contains(errOut, misownedPath) || !strings.Contains(errOut, `"mono"`) {
+		t.Errorf("history stderr must name the file and the foreign node, got %q", errOut)
+	}
+
+	// A submit batch touching the misowned node is refused as a whole: no
+	// success line, no counts, and the first-time node in the batch is not
+	// created either.
+	batch := `[
+	  {"node":"gappy","seq":9,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":999,"missed":0},
+	  {"node":"brandnew","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":1,"missed":0}
+	]`
+	out, errOut, code = runCLI(t, f.dir, batch,
+		"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+	if code == 0 {
+		t.Errorf("submit touching a misowned node must fail non-zero; stdout=%q", out)
+	}
+	if strings.Contains(out, "submitted") {
+		t.Errorf("rejected batch must not print success or counts, stdout=%q", out)
+	}
+	if !strings.Contains(errOut, misownedPath) {
+		t.Errorf("submit stderr must name the misowned file, got %q", errOut)
+	}
+	if _, err := os.Stat(nodeFileHexPath(f.dir, "brandnew")); !os.IsNotExist(err) {
+		t.Errorf("brand-new node file must not be created, stat err=%v", err)
+	}
+
+	// The real owner of the copied records is unaffected.
+	out, _, code = health(t, f,
+		"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "9")
+	if code != 0 || !strings.Contains(out, "node=mono") {
+		t.Errorf("real owner must still query normally: code=%d out=%q", code, out)
+	}
+}
