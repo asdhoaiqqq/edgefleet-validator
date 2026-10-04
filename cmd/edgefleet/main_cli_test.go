@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -735,5 +736,312 @@ func TestCLISubmitValidUnicodeNodeRoundTrip(t *testing.T) {
 		"heartbeat", "history", "--data-dir", dir, "--node", "val-😀")
 	if code != 0 || !strings.Contains(out, "node=val-😀 seq=1") {
 		t.Errorf("history for emoji id: code=%d out=%q", code, out)
+	}
+}
+
+// submit runs one submit command and returns its full result for inspection.
+func submit(t *testing.T, dir, json string) (string, string, int) {
+	t.Helper()
+	return runCLI(t, dir, json,
+		"heartbeat", "submit", "--data-dir", dir, "--receive-time", cliReceiveAt)
+}
+
+// history runs the history command for one node.
+func historyCLI(t *testing.T, dir, node string) (string, string, int) {
+	t.Helper()
+	return runCLI(t, dir, "",
+		"heartbeat", "history", "--data-dir", dir, "--node", node)
+}
+
+// historyLines returns the non-empty history lines for a node.
+func historyLines(t *testing.T, dir, node string) []string {
+	t.Helper()
+	out, errOut, code := historyCLI(t, dir, node)
+	if code != 0 {
+		t.Fatalf("history for %q exited %d: stderr=%q", node, code, errOut)
+	}
+	return outputLines(out)
+}
+
+// TestCLISubmitMixedBatchCountsNewAndDuplicate drives the example rule end to
+// end: a batch may mix records already saved, exact repeats within the same
+// batch, and new records for other nodes. new counts only records genuinely
+// added this time; duplicate counts every input record that added nothing.
+// The same seq used by different nodes is never deduplicated across nodes.
+func TestCLISubmitMixedBatchCountsNewAndDuplicate(t *testing.T) {
+	dir := t.TempDir()
+
+	// 甲 already has seq 1 saved.
+	submitBatch(t, dir, `[
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":100,"missed":0}
+	]`)
+
+	// Batch: 甲 seq1 again verbatim (duplicate against history), 甲 seq2 twice
+	// identical (one new, one duplicate within the batch), 乙 seq2 (new). The
+	// two nodes share seq 2 but stay distinct records.
+	out, errOut, code := submit(t, dir, `[
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":100,"missed":0},
+	  {"node":"甲","seq":2,"collected_at":"2026-10-01T11:59:30Z","version":"1.26.0","height":101,"missed":0},
+	  {"node":"甲","seq":2,"collected_at":"2026-10-01T11:59:30Z","version":"1.26.0","height":101,"missed":0},
+	  {"node":"乙","seq":2,"collected_at":"2026-10-01T11:59:30Z","version":"1.26.0","height":201,"missed":2}
+	]`)
+	if code != 0 {
+		t.Fatalf("mixed batch must succeed, exit=%d stderr=%q", code, errOut)
+	}
+	if errOut != "" {
+		t.Errorf("a successful submit must leave stderr empty, got %q", errOut)
+	}
+	if strings.TrimRight(out, "\n") != "submitted: new=2 duplicate=2" {
+		t.Errorf("stdout = %q, want submitted: new=2 duplicate=2", out)
+	}
+
+	// 甲 history: exactly seq 1 and 2, ascending, original seq-1 telemetry
+	// untouched and seq-2 content as submitted.
+	jia := historyLines(t, dir, "甲")
+	if len(jia) != 2 {
+		t.Fatalf("甲 history = %q, want exactly two records", jia)
+	}
+	want1 := "node=甲 seq=1 collected_at=2026-10-01T11:59:00Z version=1.26.0 height=100 missed=0"
+	want2 := "node=甲 seq=2 collected_at=2026-10-01T11:59:30Z version=1.26.0 height=101 missed=0"
+	if jia[0] != want1 {
+		t.Errorf("甲 first line = %q, want %q", jia[0], want1)
+	}
+	if jia[1] != want2 {
+		t.Errorf("甲 second line = %q, want %q", jia[1], want2)
+	}
+
+	// 乙 has only its own seq 2; same seq number as 甲 did not dedup.
+	yi := historyLines(t, dir, "乙")
+	if len(yi) != 1 {
+		t.Fatalf("乙 history = %q, want exactly one record", yi)
+	}
+	wantYi := "node=乙 seq=2 collected_at=2026-10-01T11:59:30Z version=1.26.0 height=201 missed=2"
+	if yi[0] != wantYi {
+		t.Errorf("乙 line = %q, want %q", yi[0], wantYi)
+	}
+}
+
+// TestCLISubmitSameInstantDifferentOffsetIsDuplicate pins the time semantics
+// of "identical content": the same instant written with another timezone
+// offset is a duplicate, both within a batch and against saved history.
+func TestCLISubmitSameInstantDifferentOffsetIsDuplicate(t *testing.T) {
+	dir := t.TempDir()
+
+	// 11:00:00Z is the same instant as 19:00:00+08:00.
+	out, errOut, code := submit(t, dir, `[
+	  {"node":"n1","seq":1,"collected_at":"2026-10-01T11:00:00Z","version":"1.0","height":10,"missed":0},
+	  {"node":"n1","seq":1,"collected_at":"2026-10-01T19:00:00+08:00","version":"1.0","height":10,"missed":0}
+	]`)
+	if code != 0 {
+		t.Fatalf("same-instant pair inside one batch must be accepted: exit=%d stderr=%q", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != "submitted: new=1 duplicate=1" {
+		t.Errorf("in-batch timezone-equal record: stdout=%q, want new=1 duplicate=1", out)
+	}
+
+	// Against saved history, the offset-spelled repeat is still a duplicate.
+	out, errOut, code = submit(t, dir, `[
+	  {"node":"n1","seq":1,"collected_at":"2026-10-01T07:00:00-04:00","version":"1.0","height":10,"missed":0}
+	]`)
+	if code != 0 {
+		t.Fatalf("same-instant resubmit must succeed: exit=%d stderr=%q", code, errOut)
+	}
+	if errOut != "" {
+		t.Errorf("duplicate resubmit must leave stderr empty, got %q", errOut)
+	}
+	if strings.TrimRight(out, "\n") != "submitted: new=0 duplicate=1" {
+		t.Errorf("stdout=%q, want new=0 duplicate=1", out)
+	}
+
+	lines := historyLines(t, dir, "n1")
+	if len(lines) != 1 {
+		t.Fatalf("history = %q, want the one record with no extra copy", lines)
+	}
+}
+
+// TestCLISubmitContentDifferencesConflictAgainstHistory covers every field
+// that makes a same-node/same-seq record a conflict rather than a duplicate:
+// version, height, cumulative missed, and the collection instant (including
+// equal wall-clock text with a different offset, which is a different
+// instant). Nothing is overwritten and no last-write-wins occurs.
+func TestCLISubmitContentDifferencesConflictAgainstHistory(t *testing.T) {
+	const base = `{"node":"%s","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":100,"missed":0}`
+	cases := []struct {
+		name string
+		// incoming is the conflicting record, same node+seq as the saved one.
+		incoming string
+	}{
+		{"version differs",
+			`{"node":"%s","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.27.0","height":100,"missed":0}`},
+		{"height differs",
+			`{"node":"%s","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":101,"missed":0}`},
+		{"missed differs",
+			`{"node":"%s","seq":2,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":100,"missed":1}`},
+		{"collected instant differs",
+			`{"node":"%s","seq":2,"collected_at":"2026-10-01T11:58:00Z","version":"1.26.0","height":100,"missed":0}`},
+		{"same wall clock text, different offset is a different instant",
+			`{"node":"%s","seq":2,"collected_at":"2026-10-01T11:59:00+08:00","version":"1.26.0","height":100,"missed":0}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// Each subtest gets its own data directory, so one fixed node id
+			// carrying the saved seq-2 baseline is enough.
+			const node = "node"
+			submitBatch(t, dir, "["+fmt.Sprintf(base, node)+"]")
+			before := historyLines(t, dir, node)
+
+			out, errOut, code := submit(t, dir, "["+fmt.Sprintf(tc.incoming, node)+"]")
+			if code == 0 {
+				t.Fatalf("conflicting record must fail non-zero; stdout=%q", out)
+			}
+			// The error names the node and the seq, and goes to stderr.
+			for _, want := range []string{"error:", "conflict", node, "seq 2"} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr %q must contain %q", errOut, want)
+				}
+			}
+			// No success line or counters on stdout.
+			if strings.Contains(out, "submitted") || strings.Contains(out, "new=") {
+				t.Errorf("rejected batch must not print success counts, stdout=%q", out)
+			}
+			// The original telemetry is intact: not replaced by the incoming
+			// content, not counted as a duplicate.
+			after := historyLines(t, dir, node)
+			if len(after) != 1 || after[0] != before[0] {
+				t.Errorf("history changed after conflict:\nbefore=%q\nafter =%q", before, after)
+			}
+		})
+	}
+}
+
+// TestCLISubmitConflictWithinBatchRejectsEverything checks the first conflict
+// condition: two records of the same node+seq with differing content inside
+// one batch fail the whole batch. Legal records for other nodes — whether
+// they appear before or after the conflicting pair — must not survive, and a
+// pre-existing node touched by a legal record in the same batch stays as it
+// was before the submit.
+func TestCLISubmitConflictWithinBatchRejectsEverything(t *testing.T) {
+	dir := t.TempDir()
+	// Existing node 旧 with seq 1 already saved.
+	submitBatch(t, dir, `[
+	  {"node":"旧","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":10,"missed":0}
+	]`)
+	oldBefore := readNodeFile(t, dir, "旧")
+
+	// Batch layout: legal record for a brand-new node 新, then a legal seq-2
+	// for the existing node, then the in-batch conflict on 甲 seq 1, then
+	// another legal new-node record. None of the legal ones may be saved.
+	batch := `[
+	  {"node":"新","seq":1,"collected_at":"2026-10-01T11:59:10Z","version":"1.0","height":20,"missed":0},
+	  {"node":"旧","seq":2,"collected_at":"2026-10-01T11:59:20Z","version":"1.0","height":11,"missed":0},
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:30Z","version":"1.0","height":100,"missed":0},
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:30Z","version":"2.0","height":100,"missed":0},
+	  {"node":"丙","seq":1,"collected_at":"2026-10-01T11:59:40Z","version":"1.0","height":30,"missed":0}
+	]`
+	out, errOut, code := submit(t, dir, batch)
+	if code == 0 {
+		t.Fatalf("in-batch conflict must fail non-zero; stdout=%q", out)
+	}
+	for _, want := range []string{"error:", "conflict", "甲", "seq 1"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr %q must contain %q", errOut, want)
+		}
+	}
+	if strings.Contains(out, "submitted") || strings.Contains(out, "new=") {
+		t.Errorf("rejected batch must print no success counts, stdout=%q", out)
+	}
+
+	// Existing node untouched even though its legal record came first.
+	if got := readNodeFile(t, dir, "旧"); got != oldBefore {
+		t.Errorf("existing node file was modified by the rejected batch")
+	}
+	// Brand-new nodes in the batch must have no history at all.
+	for _, node := range []string{"新", "甲", "丙"} {
+		out, errOut, code := historyCLI(t, dir, node)
+		if code != 0 {
+			t.Fatalf("history query after rejected batch must itself work for %q: %d %q", node, code, errOut)
+		}
+		if strings.TrimRight(out, "\n") != "node="+node+" no heartbeats" {
+			t.Errorf("node %q must have no records after rejected batch, got %q", node, out)
+		}
+		if _, err := os.Stat(nodeFileHexPath(dir, node)); !os.IsNotExist(err) {
+			t.Errorf("no file may be created for node %q, stat err=%v", node, err)
+		}
+	}
+}
+
+// TestCLISubmitConflictWithSavedHistoryRejectsWholeBatch checks the second
+// conflict condition: a batch record whose node+seq already exists with
+// different content fails the batch, including legal records placed before
+// it. After the failure the store keeps accepting ordinary batches, and all
+// previously saved content stays queryable.
+func TestCLISubmitConflictWithSavedHistoryRejectsWholeBatch(t *testing.T) {
+	dir := t.TempDir()
+	// 甲 already saved seq 1 with specific telemetry.
+	submitBatch(t, dir, `[
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.26.0","height":100,"missed":0}
+	]`)
+	jiaBefore := readNodeFile(t, dir, "甲")
+
+	// Legal record for a new node FIRST, then the conflict against saved
+	// history, then another legal new-node record.
+	batch := `[
+	  {"node":"乙","seq":1,"collected_at":"2026-10-01T11:59:10Z","version":"1.0","height":200,"missed":1},
+	  {"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"9.9.9","height":100,"missed":0},
+	  {"node":"丙","seq":1,"collected_at":"2026-10-01T11:59:20Z","version":"1.0","height":300,"missed":2}
+	]`
+	out, errOut, code := submit(t, dir, batch)
+	if code == 0 {
+		t.Fatalf("history conflict must fail non-zero; stdout=%q", out)
+	}
+	for _, want := range []string{"error:", "conflict", "甲", "seq 1"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr %q must contain %q", errOut, want)
+		}
+	}
+	if strings.Contains(out, "submitted") || strings.Contains(out, "new=") {
+		t.Errorf("rejected batch must print no success counts, stdout=%q", out)
+	}
+
+	// 甲 history is byte-identical to before the attempt.
+	if got := readNodeFile(t, dir, "甲"); got != jiaBefore {
+		t.Errorf("saved node file was modified by the conflicting batch")
+	}
+	// The legal new-node records must not have landed.
+	for _, node := range []string{"乙", "丙"} {
+		out, _, _ := historyCLI(t, dir, node)
+		if strings.TrimRight(out, "\n") != "node="+node+" no heartbeats" {
+			t.Errorf("node %q must have no records after rejected batch, got %q", node, out)
+		}
+		if _, err := os.Stat(nodeFileHexPath(dir, node)); !os.IsNotExist(err) {
+			t.Errorf("no file may be created for node %q, stat err=%v", node, err)
+		}
+	}
+
+	// After the conflict failure, a non-conflicting batch succeeds normally,
+	// including a genuine new seq for 甲 and the previously rejected node.
+	out, errOut, code = submit(t, dir, `[
+	  {"node":"甲","seq":2,"collected_at":"2026-10-01T11:59:40Z","version":"1.26.0","height":102,"missed":0},
+	  {"node":"乙","seq":1,"collected_at":"2026-10-01T11:59:10Z","version":"1.0","height":200,"missed":1}
+	]`)
+	if code != 0 {
+		t.Fatalf("legal batch after a conflict failure must still succeed: exit=%d stderr=%q", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != "submitted: new=2 duplicate=0" {
+		t.Errorf("recovery submit stdout=%q, want new=2 duplicate=0", out)
+	}
+
+	// 甲 keeps the original seq-1 content (not the conflict's) and gains the
+	// new seq 2, ascending.
+	jia := historyLines(t, dir, "甲")
+	if len(jia) != 2 {
+		t.Fatalf("甲 history = %q, want seq 1 and 2", jia)
+	}
+	if jia[0] != "node=甲 seq=1 collected_at=2026-10-01T11:59:00Z version=1.26.0 height=100 missed=0" {
+		t.Errorf("original 甲 seq 1 telemetry altered: %q", jia[0])
+	}
+	if jia[1] != "node=甲 seq=2 collected_at=2026-10-01T11:59:40Z version=1.26.0 height=102 missed=0" {
+		t.Errorf("new 甲 seq 2 line = %q", jia[1])
 	}
 }
