@@ -105,13 +105,15 @@ type windowState struct {
 // Fatal record problems return *InputError; results already written to out
 // stay written, and open windows are not flushed at end of input.
 //
-// A read failure is distinct from reaching the end of input. At clean
-// io.EOF a final record that arrived without a trailing newline is still
-// processed (and a damaged one is an *InputError carrying its physical line
-// number). When r returns any other error after delivering bytes, only
-// records whose newline was already received are processed, in order,
-// including records returned by the same Read that carried the error; the
-// remaining unterminated bytes never become an event, watermark or idle
+// A read failure is distinct from reaching the end of input. Only a bare
+// io.EOF returned directly by the reader is a clean end of input; an io.EOF
+// wrapped with context or joined with other errors is a read failure like
+// any other. At clean io.EOF a final record that arrived without a trailing
+// newline is still processed (and a damaged one is an *InputError carrying
+// its physical line number). When r returns any other error after delivering
+// bytes, only records whose newline was already received are processed, in
+// order, including records returned by the same Read that carried the error;
+// the remaining unterminated bytes never become an event, watermark or idle
 // declaration and can produce no late notice or window result, and the
 // reader's own error is then returned unchanged so errors.Is exposes it. A
 // record or output failure on one of those complete lines is reported
@@ -237,18 +239,19 @@ var errAggregateBadReadCount = errors.New("aggregate reader returned an impossib
 
 // readAggregateLines feeds newline-delimited physical lines from r to handle,
 // counting every line (a bare "\n" is a blank line too) and stripping a single
-// trailing '\r' so CRLF input works as before. Clean end of input and a
-// non-EOF read failure are handled differently: at clean io.EOF a final line
-// missing its newline is still delivered, exactly like every other final
-// record; after a non-EOF read error only lines whose newline was already
-// received (including those delivered by the same Read that carried the
-// error) are handled, in order, and then the reader's original error is
-// returned. The unterminated tail never reaches handle, so a read failure
-// mid-record can neither be misreported as an input error nor produce
-// events, watermarks, idle declarations, late notices or window results. A
-// non-nil error from handle stops reading immediately and replaces the read
-// error, so an earlier record or output failure is not overwritten by a
-// failure the reader only reports later.
+// trailing '\r' so CRLF input works as before. Clean end of input and a read
+// failure are handled differently: only a bare io.EOF is a clean end of input
+// (an io.EOF wrapped with context or joined with other errors is a failure),
+// and at clean io.EOF a final line missing its newline is still delivered,
+// exactly like every other final record; after any other read error only
+// lines whose newline was already received (including those delivered by the
+// same Read that carried the error) are handled, in order, and then the
+// reader's original error is returned. The unterminated tail never reaches
+// handle, so a read failure mid-record can neither be misreported as an input
+// error nor produce events, watermarks, idle declarations, late notices or
+// window results. A non-nil error from handle stops reading immediately and
+// replaces the read error, so an earlier record or output failure is not
+// overwritten by a failure the reader only reports later.
 func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error) error {
 	// buf[start:end] is the undelivered tail; buf[:start] is space freed by
 	// already delivered lines. The buffer is compacted and grown like
@@ -303,7 +306,10 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 			start += i + 1
 		}
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
+			// Only a bare io.EOF is a clean end of input: an io.EOF wrapped
+			// with context or joined with another error still carries a real
+			// failure, so it is handled like any other read error below.
+			if readErr == io.EOF {
 				// Clean end of input: a trailing line without a newline is a
 				// complete final record; an empty tail (input ending exactly
 				// on '\n') is nothing, not an extra blank line.

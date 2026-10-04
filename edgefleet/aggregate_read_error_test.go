@@ -133,6 +133,90 @@ func TestReadAggregateLinesEOFVsReadError(t *testing.T) {
 	})
 }
 
+// TestReadAggregateWrappedEOFIsAReadFailure: only a bare io.EOF is a clean
+// end of input. An io.EOF wrapped with context (fmt.Errorf %w) or joined
+// with another error (errors.Join) still carries a failure, so the
+// unterminated tail must not become a record, no window may close, and the
+// caller must get the original error back with its chain intact.
+func TestReadAggregateWrappedEOFIsAReadFailure(t *testing.T) {
+	event := `{"type":"event","key":"k","time":100,"value":2}` + "\n"
+	watermarkTail := `{"type":"watermark","time":1000}` // no newline
+
+	errSentinel := errors.New("synthetic upstream read failure")
+	wrappedEOF := fmt.Errorf("reading stream: %w", io.EOF)
+	joinedEOF := errors.Join(io.EOF, errSentinel)
+
+	cases := []struct {
+		name    string
+		err     error
+		findErr error // must be reachable through errors.Is on the result
+	}{
+		{"wrapped io.EOF", wrappedEOF, io.EOF},
+		{"joined io.EOF and failure", joinedEOF, errSentinel},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := event + watermarkTail
+			var out, late bytes.Buffer
+			err := RunAggregate(&failingAfterReader{
+				data: []byte(input), failAt: len(input),
+				err: tc.err, errOnBoundary: true,
+			}, 1000, &out, &late)
+			if err == nil {
+				t.Fatalf("a wrapped/joined io.EOF is a read failure, not a clean end of input")
+			}
+			if !errors.Is(err, tc.findErr) {
+				t.Fatalf("error = %v, want errors.Is to reach %v", err, tc.findErr)
+			}
+			if _, ok := err.(*InputError); ok {
+				t.Fatalf("read failure must not be masked by a JSON/input error: %v", err)
+			}
+			if out.String() != "" {
+				t.Fatalf("unterminated watermark must not close [0,1000): %q", out.String())
+			}
+			if late.String() != "" {
+				t.Fatalf("unterminated tail must not produce late notices: %q", late.String())
+			}
+		})
+	}
+
+	// Control: the same bytes ending in a bare io.EOF are a clean end of
+	// input, so the unterminated watermark closes [0,1000).
+	t.Run("bare io.EOF still processes the final record", func(t *testing.T) {
+		input := event + watermarkTail
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: io.EOF, errOnBoundary: true,
+		}, 1000, &out, &late)
+		if err != nil {
+			t.Fatalf("bare io.EOF is a clean end of input: %v", err)
+		}
+		want := `{"key":"k","start":0,"end":1000,"count":1,"sum":2}` + "\n"
+		if out.String() != want {
+			t.Fatalf("got %q, want %q", out.String(), want)
+		}
+	})
+
+	// A newline-terminated record co-delivered with a wrapped io.EOF is still
+	// processed first; the failure surfaces afterwards.
+	t.Run("terminated record before wrapped io.EOF is kept", func(t *testing.T) {
+		input := event + watermarkTail + "\n"
+		var out, late bytes.Buffer
+		err := RunAggregate(&failingAfterReader{
+			data: []byte(input), failAt: len(input),
+			err: wrappedEOF, errOnBoundary: true,
+		}, 1000, &out, &late)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("error = %v, want the wrapped read failure via errors.Is", err)
+		}
+		want := `{"key":"k","start":0,"end":1000,"count":1,"sum":2}` + "\n"
+		if out.String() != want {
+			t.Fatalf("newline-terminated watermark must close the window first:\n got: %q\nwant: %q", out.String(), want)
+		}
+	})
+}
+
 // TestReadAggregateErrorUnterminatedTailIsNotARecord drives the exact scenario
 // from the fix: length-1000 windows, event key=k time=100 value=2 with a
 // newline, then a time=1000 watermark JSON without a newline, and the reader
