@@ -291,27 +291,15 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 }
 
 // validateStoredRecords checks the structural invariants of a strictly
-// decoded record set: sorted by ascending seq with no duplicate seq and
-// valid field values. Position numbers are 1-based to match decoder errors.
+// decoded record set: valid field values and ascending seq with no
+// duplicate seq. The value rules themselves are the single shared set used
+// at every trust boundary (checkHeartbeatFields); only the wording and the
+// 1-based record position belong to the stored-file path. Position numbers
+// match decoder errors.
 func validateStoredRecords(records []Heartbeat) error {
 	for i, r := range records {
-		if r.NodeID == "" {
-			return fmt.Errorf("record %d: field %q must not be empty", i+1, "node")
-		}
-		if r.Seq <= 0 {
-			return fmt.Errorf("record %d: field %q must be a positive integer, got %d", i+1, "seq", r.Seq)
-		}
-		if r.Version == "" {
-			return fmt.Errorf("record %d: field %q must not be empty", i+1, "version")
-		}
-		if r.Height < 0 {
-			return fmt.Errorf("record %d: field %q must be >= 0, got %d", i+1, "height", r.Height)
-		}
-		if r.Missed < 0 {
-			return fmt.Errorf("record %d: field %q must be >= 0, got %d", i+1, "missed", r.Missed)
-		}
-		if r.CollectedAt.IsZero() {
-			return fmt.Errorf("record %d: field %q is missing or invalid", i+1, "collected_at")
+		if v := checkHeartbeatFields(r); v != nil {
+			return fmt.Errorf("record %d: %w", i+1, storedFieldError(*v))
 		}
 		if i > 0 && records[i-1].Seq >= r.Seq {
 			return fmt.Errorf("records not sorted by ascending seq at record %d", i+1)

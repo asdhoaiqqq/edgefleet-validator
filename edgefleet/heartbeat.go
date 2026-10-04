@@ -30,36 +30,192 @@ type Heartbeat struct {
 // heartbeatFields enumerates every field that must be explicitly provided.
 var heartbeatFields = []string{"node", "seq", "collected_at", "version", "height", "missed"}
 
-// ValidateHeartbeat checks the semantic rules for one record. receiveTime is
-// the moment the platform received the batch; a collection time later than
-// receive time is rejected.
-func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
-	if h.NodeID == "" {
-		return fmt.Errorf("node id is empty")
+// fieldViolation names the one field whose value is invalid and which rule
+// it breaks. It carries no wording of its own: every trust boundary renders
+// the same violation with the message and location context its callers
+// expect, while the rule itself lives only here.
+type fieldViolation struct {
+	field string
+	kind  violationKind
+	value int64
+}
+
+type violationKind int
+
+const (
+	violationEmpty violationKind = iota
+	violationNotUnicode
+	violationNotPositive
+	violationNegative
+	violationMissingTime
+)
+
+// fieldValidators is the single source of truth for what makes a heartbeat
+// field value legal. Field order defines both the check order at every
+// boundary and the order in which a record with several bad values reports
+// them. Node text rules (empty, valid Unicode) apply to the decoded string;
+// the raw JSON token is checked separately before decoding because
+// encoding/json rewrites invalid bytes and unpaired surrogates to U+FFFD.
+var fieldValidators = []struct {
+	field string
+	check func(Heartbeat) (violationKind, int64, bool)
+}{
+	{"node", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.NodeID == "" {
+			return violationEmpty, 0, false
+		}
+		if !utf8.ValidString(h.NodeID) {
+			return violationNotUnicode, 0, false
+		}
+		return 0, 0, true
+	}},
+	{"seq", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.Seq <= 0 {
+			return violationNotPositive, h.Seq, false
+		}
+		return 0, 0, true
+	}},
+	{"version", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.Version == "" {
+			return violationEmpty, 0, false
+		}
+		return 0, 0, true
+	}},
+	{"height", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.Height < 0 {
+			return violationNegative, h.Height, false
+		}
+		return 0, 0, true
+	}},
+	{"missed", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.Missed < 0 {
+			return violationNegative, h.Missed, false
+		}
+		return 0, 0, true
+	}},
+	{"collected_at", func(h Heartbeat) (violationKind, int64, bool) {
+		if h.CollectedAt.IsZero() {
+			return violationMissingTime, 0, false
+		}
+		return 0, 0, true
+	}},
+}
+
+// checkHeartbeatFields applies the shared field-value rules and returns the
+// first violation, or nil when every field value is legal. It does not know
+// whether the record came from JSON submit input, a direct Go caller or a
+// saved file; the receive-time rule and all raw-JSON/file checks live at
+// those boundaries instead.
+func checkHeartbeatFields(h Heartbeat) *fieldViolation {
+	for _, v := range fieldValidators {
+		if kind, value, ok := v.check(h); !ok {
+			return &fieldViolation{field: v.field, kind: kind, value: value}
+		}
 	}
-	if !utf8.ValidString(h.NodeID) {
+	return nil
+}
+
+// submitFieldError renders a violation with the wording of the submit
+// boundaries: ValidateHeartbeat for directly constructed records and the
+// strict JSON decoder for parsed records share these phrasings.
+func submitFieldError(v fieldViolation) error {
+	switch v.kind {
+	case violationEmpty:
+		if v.field == "node" {
+			return fmt.Errorf("node id is empty")
+		}
+		return fmt.Errorf("%s is empty", v.field)
+	case violationNotUnicode:
 		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
-	}
-	if h.Seq <= 0 {
-		return fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
-	}
-	if h.Version == "" {
-		return fmt.Errorf("version is empty")
-	}
-	if h.Height < 0 {
-		return fmt.Errorf("height must be >= 0, got %d", h.Height)
-	}
-	if h.Missed < 0 {
-		return fmt.Errorf("missed must be >= 0, got %d", h.Missed)
-	}
-	if h.CollectedAt.IsZero() {
+	case violationNotPositive:
+		return fmt.Errorf("%s must be a positive integer, got %d", v.field, v.value)
+	case violationNegative:
+		return fmt.Errorf("%s must be >= 0, got %d", v.field, v.value)
+	case violationMissingTime:
 		return fmt.Errorf("collected_at is missing or invalid")
+	default:
+		return fmt.Errorf("%s is invalid", v.field)
 	}
+}
+
+// storedFieldError renders a violation the way stored-file validation
+// reports it: record position is added by the caller and the message names
+// the field in quotes.
+func storedFieldError(v fieldViolation) error {
+	switch v.kind {
+	case violationEmpty:
+		return fmt.Errorf("field %q must not be empty", v.field)
+	case violationNotPositive:
+		return fmt.Errorf("field %q must be a positive integer, got %d", v.field, v.value)
+	case violationNegative:
+		return fmt.Errorf("field %q must be >= 0, got %d", v.field, v.value)
+	case violationMissingTime:
+		return fmt.Errorf("field %q is missing or invalid", v.field)
+	default:
+		return fmt.Errorf("field %q is invalid", v.field)
+	}
+}
+
+// fieldValueViolation runs just one named field's shared value rule. The
+// strict decoder uses it field by field as each value is decoded, so a bad
+// value is reported at the same point as before rather than only after the
+// whole object has been decoded.
+func fieldValueViolation(name string, h Heartbeat) *fieldViolation {
+	for _, v := range fieldValidators {
+		if v.field == name {
+			if kind, value, ok := v.check(h); !ok {
+				return &fieldViolation{field: name, kind: kind, value: value}
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// decodeFieldError renders a violation with the strict JSON decoder's
+// wording. violationNotUnicode cannot occur here — invalid raw node text is
+// rejected by validateRawNodeText before decoding and json.Unmarshal only
+// yields valid strings — and neither can violationMissingTime, because a
+// bad collected_at value fails time.Parse instead. Both are handled anyway
+// so the renderer stays exhaustive.
+func decodeFieldError(v fieldViolation) error {
+	switch v.kind {
+	case violationEmpty:
+		return fmt.Errorf("%s must not be empty", v.field)
+	case violationNotUnicode:
+		return fmt.Errorf("node contains invalid UTF-8")
+	case violationNotPositive:
+		return fmt.Errorf("%s must be a positive integer, got %d", v.field, v.value)
+	case violationNegative:
+		return fmt.Errorf("%s must be >= 0, got %d", v.field, v.value)
+	case violationMissingTime:
+		return fmt.Errorf("collected_at is missing or invalid")
+	default:
+		return fmt.Errorf("%s is invalid", v.field)
+	}
+}
+
+// checkCollectedAtReceiveTime is the submit-only rule: a record collected
+// later than the moment the platform received its batch is rejected. Equal
+// instants are allowed. It is deliberately separate from
+// checkHeartbeatFields — saved history has no receive time and must not be
+// judged against the current clock.
+func checkCollectedAtReceiveTime(h Heartbeat, receiveTime time.Time) error {
 	if h.CollectedAt.After(receiveTime) {
 		return fmt.Errorf("collected_at %s is later than receive time %s",
 			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
 	}
 	return nil
+}
+
+// ValidateHeartbeat checks the semantic rules for one directly constructed
+// record. receiveTime is the moment the platform received the batch; a
+// collection time later than receive time is rejected.
+func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
+	if v := checkHeartbeatFields(h); v != nil {
+		return submitFieldError(*v)
+	}
+	return checkCollectedAtReceiveTime(h, receiveTime)
 }
 
 // Equal reports whether two records are the same telemetry. Collection times
@@ -165,6 +321,11 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 
 	var h Heartbeat
 
+	// Each field keeps its own boundary order — null check, type decode,
+	// raw-token/format check — while the value rules themselves come from
+	// the single shared set in fieldValidators. Rendering uses the strict
+	// decoder's wording ("X must not be empty"), which both the submit and
+	// stored-file paths already share through this function.
 	if err := rejectNull(fields["node"], "node"); err != nil {
 		return Heartbeat{}, err
 	}
@@ -174,8 +335,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := validateRawNodeText(fields["node"]); err != nil {
 		return Heartbeat{}, err
 	}
-	if h.NodeID == "" {
-		return Heartbeat{}, fmt.Errorf("node must not be empty")
+	if v := fieldValueViolation("node", h); v != nil {
+		return Heartbeat{}, decodeFieldError(*v)
 	}
 
 	if err := rejectNull(fields["seq"], "seq"); err != nil {
@@ -184,8 +345,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["seq"], &h.Seq); err != nil {
 		return Heartbeat{}, fmt.Errorf("seq must be an integer: %w", err)
 	}
-	if h.Seq <= 0 {
-		return Heartbeat{}, fmt.Errorf("seq must be a positive integer, got %d", h.Seq)
+	if v := fieldValueViolation("seq", h); v != nil {
+		return Heartbeat{}, decodeFieldError(*v)
 	}
 
 	if err := rejectNull(fields["collected_at"], "collected_at"); err != nil {
@@ -207,8 +368,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["version"], &h.Version); err != nil {
 		return Heartbeat{}, fmt.Errorf("version must be a string: %w", err)
 	}
-	if h.Version == "" {
-		return Heartbeat{}, fmt.Errorf("version must not be empty")
+	if v := fieldValueViolation("version", h); v != nil {
+		return Heartbeat{}, decodeFieldError(*v)
 	}
 
 	if err := rejectNull(fields["height"], "height"); err != nil {
@@ -217,8 +378,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["height"], &h.Height); err != nil {
 		return Heartbeat{}, fmt.Errorf("height must be an integer: %w", err)
 	}
-	if h.Height < 0 {
-		return Heartbeat{}, fmt.Errorf("height must be >= 0, got %d", h.Height)
+	if v := fieldValueViolation("height", h); v != nil {
+		return Heartbeat{}, decodeFieldError(*v)
 	}
 
 	if err := rejectNull(fields["missed"], "missed"); err != nil {
@@ -227,8 +388,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["missed"], &h.Missed); err != nil {
 		return Heartbeat{}, fmt.Errorf("missed must be an integer: %w", err)
 	}
-	if h.Missed < 0 {
-		return Heartbeat{}, fmt.Errorf("missed must be >= 0, got %d", h.Missed)
+	if v := fieldValueViolation("missed", h); v != nil {
+		return Heartbeat{}, decodeFieldError(*v)
 	}
 
 	return h, nil
@@ -330,9 +491,8 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 	if err != nil {
 		return Heartbeat{}, err
 	}
-	if h.CollectedAt.After(receiveTime) {
-		return Heartbeat{}, fmt.Errorf("collected_at %s is later than receive time %s",
-			h.CollectedAt.Format(time.RFC3339), receiveTime.Format(time.RFC3339))
+	if err := checkCollectedAtReceiveTime(h, receiveTime); err != nil {
+		return Heartbeat{}, err
 	}
 	return h, nil
 }
