@@ -346,9 +346,14 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 	// buf[start:end] is the undelivered tail; buf[:start] is space freed by
 	// already delivered lines. The buffer is compacted and grown like
 	// bufio.Scanner's, so a long unterminated line is bounded by
-	// maxAggregateLineBytes instead of growing without limit.
+	// maxAggregateLineBytes instead of growing without limit. search is the
+	// newline scan cursor: buf[start:search] is already known to contain no
+	// '\n', so only newly arrived bytes are scanned. Without it a long line
+	// delivered in many small reads would be rescanned from the front after
+	// every read, making the splitting work quadratic in the line length.
 	buf := make([]byte, 64*1024)
 	start, end := 0, 0
+	search := 0
 	lineNo := 0
 	emptyReads := 0
 	deliver := func(b []byte) error {
@@ -362,6 +367,7 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 		if start > 0 && (end == len(buf) || start > len(buf)/2) {
 			copy(buf, buf[start:end])
 			end -= start
+			search -= start
 			start = 0
 		}
 		if end == len(buf) {
@@ -377,6 +383,7 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 			copy(grown, buf[start:end])
 			buf = grown
 			end -= start
+			search -= start
 			start = 0
 		}
 		n, readErr := r.Read(buf[end:])
@@ -386,14 +393,19 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 		}
 		end += n
 		for {
-			i := bytes.IndexByte(buf[start:end], '\n')
+			i := bytes.IndexByte(buf[search:end], '\n')
 			if i < 0 {
+				// No newline in the unscanned part: everything up to end is
+				// now known newline-free and is never scanned again.
+				search = end
 				break
 			}
-			if err := deliver(buf[start : start+i]); err != nil {
+			lineEnd := search + i
+			if err := deliver(buf[start:lineEnd]); err != nil {
 				return err
 			}
-			start += i + 1
+			start = lineEnd + 1
+			search = start
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
