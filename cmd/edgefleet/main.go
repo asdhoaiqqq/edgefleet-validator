@@ -240,8 +240,12 @@ func cmdHealth(args []string) {
 		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", result.NodeID)
 		return
 	}
+	// RFC3339Nano keeps the existing whole-second display (e.g.
+	// 2026-10-01T11:59:00Z) but preserves sub-second fractions when the
+	// heartbeat reported them; dropping them would hide the precision the
+	// online/offline boundary is judged at (60s + 1ns).
 	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
-		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
+		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339Nano),
 		result.Version, result.Height, result.Missed, result.Findings)
 	if isFlagPassed(fs, "missed-since-seq") {
 		// missed above stays cumulative; this line states the alarm basis.
@@ -296,7 +300,7 @@ func cmdHistory(args []string) {
 	}
 	for _, r := range records {
 		fmt.Printf("node=%s seq=%d collected_at=%s version=%s height=%d missed=%d\n",
-			r.NodeID, r.Seq, r.CollectedAt.Format(time.RFC3339), r.Version, r.Height, r.Missed)
+			r.NodeID, r.Seq, r.CollectedAt.Format(time.RFC3339Nano), r.Version, r.Height, r.Missed)
 	}
 }
 
