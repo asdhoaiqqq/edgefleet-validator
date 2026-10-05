@@ -196,6 +196,271 @@ aggregate: line 5: event for idle partition 1 is not allowed; send a watermark t
 
 这两类失败都会报告物理输入行号和原因、停止处理后续记录（上例中第 6 行的水位线不会再被读取），退出码为 1，但此前已输出的窗口结果全部保留。
 
+## 通过 Go 库接入：正常结束与读取失败
+
+除了上面的 `aggregate` 命令，Go 调用方可以直接使用库入口 `edgefleet.RunAggregate(r io.Reader, windowMillis int64, out, lateLog io.Writer) error`（滑动窗口与多分区分别用 `RunAggregateSliding`、`RunAggregatePartitioned`、`RunAggregatePartitionedSliding`，结束语义完全相同）。它从 `r` 读取逐行 JSON，把关闭的窗口结果（一行一个 JSON 对象，含末尾换行）写入 `out`，把迟到事件提示写入 `lateLog`。窗口规则与命令行一致：1000 毫秒固定窗口从时间零开始、左闭右开，即 `[0,1000)`、`[1000,2000)`……只在输入水位线推进到 `end ≤ 水位线` 时输出，按 end 升序、再按 key 的 UTF-8 字节序输出；**输入结束（无论正常还是故障）都不会补发仍未关闭的窗口**。
+
+接入自己的输入源（`net.Conn`、管道、设备驱动等）时，最关键的是区分“输入正常结束”和“读取失败”，规则如下：
+
+- **只有读取器直接返回裸 `io.EOF` 才是正常结束。** 此时若最后一条记录没有末尾换行，它仍作为完整的最终记录处理；正常结束时 `RunAggregate` 返回 `nil`。
+- **包装过的 `io.EOF` 仍是读取故障。** 即使 `errors.Is(err, io.EOF)` 为 `true`（`fmt.Errorf("...: %w", io.EOF)` 或用 `Unwrap() []error` 同时携带 `io.EOF` 和其他原因的组合错误），也不能把本次调用当作成功。判定成功只能看返回的 `err` 是否为 `nil`，不要用 `errors.Is(err, io.EOF)` 反推。
+- **读取故障时只处理已经收到换行的完整记录。** 读取器在返回一批字节的同时报告错误时，这批字节里已经带换行的记录仍按顺序全部生效（包括与错误同一次 `Read` 返回的记录），之后读取器自己的错误会被**原样**返回，`errors.Is`/`errors.As` 能直接访问输入源报告的原因；它不会被误报成某一行 JSON 不合法。没有换行的未结束尾部被整体舍弃，永远不会成为事件、水位线或休眠声明，因此既不会产生迟到提示，也不会触发或补发任何窗口结果。
+- **同批完整记录本身出错时，记录错误优先。** 若与读取故障同批交付的某条完整记录（已收到换行）本身有格式错误，返回的是 `*edgefleet.InputError`，按**包含空行在内的物理行号**定位；读取故障虽然是同一次 Read 发现的，也不会覆盖它。此后的记录和未结束尾部都不再处理。写出过程中的失败同理，以 `*edgefleet.OutputError` 为准。
+- **已经写入 `out` 的窗口结果始终有效并保留。** 每行结果对应一个已关闭的 `[start,end)` 区间，行内 `count`/`sum` 就是该区间内全部非迟到事件的计数与求和；运行后期失败不会撤回它们。反过来说，没有出现在 `out` 中的窗口是“尚未关闭、从未输出”，而不是 count 为 0 的结果——读取故障不会补发它们。
+
+### 完整可离线运行的示例
+
+下面的程序位于 [`examples/aggregate-read-errors/main.go`](examples/aggregate-read-errors/main.go)，输入、输出全部在内存中，不访问网络、不读文件、不依赖当前时间，可直接离线运行：
+
+```bash
+go run ./examples/aggregate-read-errors
+```
+
+完整代码：
+
+```go
+// 本程序可在本机离线运行，演示通过 Go 库接入聚合输入流时，如何区分
+// “输入正常结束”和“输入读取失败”：
+//
+//	go run ./examples/aggregate-read-errors
+//
+// 它使用 edgefleet.RunAggregate、1000 毫秒固定窗口，输入与输出全部在内存中，
+// 不访问网络、不读取文件、不依赖当前时间。
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/asdhoaiqqq/edgefleet-validator/edgefleet"
+)
+
+// errUpstreamRead 代表输入源（例如 net.Conn、管道或设备驱动）自身报告的读取
+// 故障。真实程序里它可以是任何携带自己原因的错误；RunAggregate 会把它原样
+// 交还调用方，因此这里用 errors.Is 即可识别输入源给出的原因。
+var errUpstreamRead = errors.New("simulated upstream device read failure")
+
+// failingReader 一次性交付 data 的全部字节：最后一次 Read 在交付剩余字节的
+// 同时返回 failErr，模拟输入源在交出最后一批字节时报告故障。它也可以返回
+// 包装过的 io.EOF——本程序场景三用它证明“包装的 EOF 仍是故障”。
+type failingReader struct {
+	data    []byte
+	pos     int
+	failErr error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, r.failErr
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	if r.pos >= len(r.data) {
+		return n, r.failErr // 字节与故障在同一批交付
+	}
+	return n, nil
+}
+
+// commonInput 是四种说明围绕的同一份输入（4 条物理记录，最后一条没有换行）：
+//
+//	第 1 行：事件 key=sensor-a time=100 value=5（带换行）
+//	第 2 行：水位线 time=1000（带换行）——关闭窗口 [0,1000)
+//	第 3 行：事件 key=sensor-a time=1100 value=7（带换行）
+//	第 4 行：水位线 time=2000（无换行）——只有正常结束时才会处理
+const commonInput = "" +
+	`{"type":"event","key":"sensor-a","time":100,"value":5}` + "\n" +
+	`{"type":"watermark","time":1000}` + "\n" +
+	`{"type":"event","key":"sensor-a","time":1100,"value":7}` + "\n" +
+	`{"type":"watermark","time":2000}`
+
+func main() {
+	runCleanEOF()
+	runReadFailure()
+	runWrappedEOF()
+	runRecordErrorInFailingBatch()
+}
+
+// dump 汇总一次 RunAggregate 调用拿到的全部结果。
+func dump(title string, r io.Reader) {
+	var out, lateLog bytes.Buffer
+	err := edgefleet.RunAggregate(r, 1000, &out, &lateLog)
+
+	fmt.Printf("=== %s ===\n", title)
+	fmt.Print("窗口结果 out:\n")
+	fmt.Print(indentOrEmpty(out.String()))
+	fmt.Printf("迟到提示 lateLog: %s\n", quotedOrEmpty(lateLog.String()))
+	fmt.Printf("返回错误 err: %v\n", errOrNil(err))
+
+	// 识别一：读取器自己的错误会原样返回，errors.Is 能找到输入源报告的原因。
+	fmt.Printf("errors.Is(err, errUpstreamRead) = %v\n", errors.Is(err, errUpstreamRead))
+	// 识别二：绝不能用 errors.Is(err, io.EOF) 判断成功。包装过的 io.EOF 仍是
+	// 读取故障（见场景三）；只有读取器直接返回裸 io.EOF 才是正常结束，而那种
+	// 情况下 RunAggregate 返回的是 nil。
+	fmt.Printf("errors.Is(err, io.EOF)         = %v\n", errors.Is(err, io.EOF))
+	// 识别三：读取故障不会被误报成某一行 JSON 不合法。
+	var in *edgefleet.InputError
+	fmt.Printf("errors.As(*edgefleet.InputError) = %v", errors.As(err, &in))
+	if in != nil {
+		fmt.Printf("（物理行号 %d，原因 %q）", in.Line, in.Reason)
+	}
+	fmt.Print("\n\n")
+}
+
+func runCleanEOF() {
+	// strings.Reader 在读完后返回裸 io.EOF。最后一条没有换行的水位线
+	// 2000 仍会作为完整的最终记录处理，于是第二个窗口也被关闭。
+	dump("场景一：正常结束（读取器直接返回裸 io.EOF）", strings.NewReader(commonInput))
+}
+
+func runReadFailure() {
+	// 同一份字节，但最后一次 Read 在交付字节的同时报告输入源故障。
+	// 已经收到换行的记录照常生效；没有换行的水位线 2000 属于未结束尾部，
+	// 必须舍弃：第二个窗口不会因为返回错误而补发。
+	dump("场景二：最后一批字节与读取故障同时到达", &failingReader{
+		data:    []byte(commonInput),
+		failErr: errUpstreamRead,
+	})
+}
+
+func runWrappedEOF() {
+	// 包装过的 io.EOF：errors.Is 能沿 Unwrap 链找到 io.EOF，但它不是裸
+	// io.EOF，库按读取故障处理——未结束尾部舍弃，包装错误原样返回。
+	wrapped := fmt.Errorf("device stream closed abruptly: %w", io.EOF)
+	dump("场景三：包装过的 io.EOF 仍按读取故障处理", &failingReader{
+		data:    []byte(commonInput),
+		failErr: wrapped,
+	})
+}
+
+func runRecordErrorInFailingBatch() {
+	// 追加一条说明：如果与故障同批交付的完整记录本身有格式错误，记录错误
+	// 优先于读取故障，按包含空行在内的物理行号定位；其后的记录和未结束
+	// 尾部都不再处理。
+	input := strings.Join([]string{
+		`{"type":"event","key":"sensor-a","time":100,"value":5}`, // 第 1 行
+		``,                                                       // 第 2 行：空行，仍占物理行号
+		`{"type":"watermark","time":1000}`,                        // 第 3 行：带换行，关闭 [0,1000)
+		`{"type":"event",}`,                                       // 第 4 行：带换行的完整行，但 JSON 非法
+		`{"type":"watermark","time":2000}`,                        // 第 5 行：无换行的未结束尾部
+	}, "\n")
+	dump("场景四：同批完整记录本身格式错误，记录错误优先", &failingReader{
+		data:    []byte(input),
+		failErr: errUpstreamRead,
+	})
+}
+
+func indentOrEmpty(s string) string {
+	if s == "" {
+		return "（空）\n"
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+		b.WriteString("  " + line + "\n")
+	}
+	return b.String()
+}
+
+func quotedOrEmpty(s string) string {
+	if s == "" {
+		return "（空）"
+	}
+	return fmt.Sprintf("%q", s)
+}
+
+func errOrNil(err error) any {
+	if err == nil {
+		return "<nil>"
+	}
+	return err
+}
+```
+
+### 同一份输入与四个场景的结果
+
+前三个场景围绕同一份输入（4 条物理记录，`␊` 表示换行；第 4 条**没有**换行）：
+
+```text
+{"type":"event","key":"sensor-a","time":100,"value":5}␊
+{"type":"watermark","time":1000}␊
+{"type":"event","key":"sensor-a","time":1100,"value":7}␊
+{"type":"watermark","time":2000}
+```
+
+- 第 1 行：事件时间 100、值 5，属于窗口 `[0,1000)`。
+- 第 2 行：水位线 1000，且自带换行，关闭 `[0,1000)`（end 恰好等于水位线，取等关闭）。
+- 第 3 行：同一 key 的事件时间 1100、值 7，属于窗口 `[1000,2000)`。
+- 第 4 行：水位线 2000，**没有换行**。它是否生效，完全取决于输入怎样结束。
+
+**场景一：正常结束（读取器返回裸 `io.EOF`，如 `strings.Reader`）。** 没有换行的最终水位线 2000 仍是完整记录、照常处理，关闭 `[1000,2000)`。用户得到两个窗口，计数均为 1，求和分别为 5 和 7；没有迟到事件，`lateLog` 为空；返回错误为 `nil`：
+
+```text
+=== 场景一：正常结束（读取器直接返回裸 io.EOF） ===
+窗口结果 out:
+  {"key":"sensor-a","start":0,"end":1000,"count":1,"sum":5}
+  {"key":"sensor-a","start":1000,"end":2000,"count":1,"sum":7}
+迟到提示 lateLog: （空）
+返回错误 err: <nil>
+errors.Is(err, errUpstreamRead) = false
+errors.Is(err, io.EOF)         = false
+errors.As(*edgefleet.InputError) = false
+```
+
+两行结果分别对应区间 `[0,1000)`（第 1 行事件，count=1、sum=5）和 `[1000,2000)`（第 3 行事件，count=1、sum=7）。
+
+**场景二：输入源在交付最后一批字节时报告读取故障。** 第 1～3 行都已收到换行，全部生效，所以第 2 行的水位线照常关闭 `[0,1000)` 并输出；第 4 行水位线 2000 的换行始终未到，属于未结束尾部，被舍弃，**不会因为这次 Read 返回了错误就补发第二个窗口**。`out` 中只保留第一个窗口，读取器的错误原样返回，可用 `errors.Is` 识别输入源自己的原因，它不是 `*edgefleet.InputError`，不会被误报成 JSON 解析失败：
+
+```text
+=== 场景二：最后一批字节与读取故障同时到达 ===
+窗口结果 out:
+  {"key":"sensor-a","start":0,"end":1000,"count":1,"sum":5}
+迟到提示 lateLog: （空）
+返回错误 err: simulated upstream device read failure
+errors.Is(err, errUpstreamRead) = true
+errors.Is(err, io.EOF)         = false
+errors.As(*edgefleet.InputError) = false
+```
+
+**场景三：读取器返回包装过的 `io.EOF`。** 字节交付方式与场景二相同，只是错误换成 `fmt.Errorf("device stream closed abruptly: %w", io.EOF)`。注意输出里 `errors.Is(err, io.EOF) = true`——但这**不代表正常结束**：它不是裸 `io.EOF`，未结束的水位线 2000 一样被舍弃，第二个窗口一样不补发，调用方必须把这次调用当作失败处理。判断成功只看 `err == nil`：
+
+```text
+=== 场景三：包装过的 io.EOF 仍按读取故障处理 ===
+窗口结果 out:
+  {"key":"sensor-a","start":0,"end":1000,"count":1,"sum":5}
+迟到提示 lateLog: （空）
+返回错误 err: device stream closed abruptly: EOF
+errors.Is(err, errUpstreamRead) = false
+errors.Is(err, io.EOF)         = true
+errors.As(*edgefleet.InputError) = false
+```
+
+**场景四：与故障同批交付的完整记录本身有格式错误。** 这条输入在第 2 行放了一个空行、在第 4 行放了一条带换行但 JSON 非法的完整记录，第 5 行仍是无换行的水位线 2000：
+
+```text
+{"type":"event","key":"sensor-a","time":100,"value":5}␊
+␊
+{"type":"watermark","time":1000}␊
+{"type":"event",}␊
+{"type":"watermark","time":2000}
+```
+
+第 3 行（物理行号 3）已带换行，先关闭 `[0,1000)`；处理到第 4 行时记录本身解析失败，于是**记录错误优先于同批发现的读取故障**，返回的是指向物理行号 4 的 `*edgefleet.InputError`（空行是第 2 行，照样占用行号）。第 4 行之后的记录不再解析，第 5 行的未结束尾部也不处理，读取故障被记录错误取代，因此 `errors.Is(err, errUpstreamRead)` 为 `false`：
+
+```text
+=== 场景四：同批完整记录本身格式错误，记录错误优先 ===
+窗口结果 out:
+  {"key":"sensor-a","start":0,"end":1000,"count":1,"sum":5}
+迟到提示 lateLog: （空）
+返回错误 err: line 4: invalid JSON record: invalid character '}' looking for beginning of object key string
+errors.Is(err, errUpstreamRead) = false
+errors.Is(err, io.EOF)         = false
+errors.As(*edgefleet.InputError) = true（物理行号 4，原因 "invalid JSON record: invalid character '}' looking for beginning of object key string"）
+```
+
+四个场景的 `lateLog` 都为空，因为这份输入里没有迟到事件。补充一点：假如未结束尾部里恰好是一条会被当前水位线判为迟到的事件，读取故障时它连记录都算不上，因此**不会**产生迟到提示——迟到提示只可能来自已收到换行的完整记录，其文本同样按物理行号定位（形如 `line N: late event time=... below current watermark ..., skipped`），它只是说明，不影响退出成功与否；故障场景下则以返回的错误为准。
+
 ## 技术方向
 
 validator, node-monitoring, device-fleet, p2p-network, telemetry, devnet
