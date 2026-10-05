@@ -110,7 +110,7 @@ func heartbeatUsage() {
 	fmt.Println("    seq           integer  sequence number (> 0)")
 	fmt.Println("    collected_at  string   RFC3339 with timezone, e.g. 2026-10-01T12:00:00+08:00")
 	fmt.Println("                           must not be later than the receive time")
-	fmt.Println("    version       string   version (non-empty)")
+	fmt.Println("    version       string   version (non-empty, valid Unicode text)")
 	fmt.Println("    height        integer  block height (>= 0)")
 	fmt.Println("    missed        integer  cumulative missed duties (>= 0)")
 	fmt.Println()

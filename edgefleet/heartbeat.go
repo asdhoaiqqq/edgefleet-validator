@@ -15,7 +15,7 @@ import (
 //	node          string   node id (required, non-empty)
 //	seq           integer  sequence number (required, > 0)
 //	collected_at  string   RFC3339 with timezone, e.g. 2026-10-01T12:00:00+08:00 (required)
-//	version       string   version (required, non-empty)
+//	version       string   version (required, non-empty, valid Unicode text)
 //	height        integer  block height (required, >= 0)
 //	missed        integer  cumulative missed duties (required, >= 0)
 type Heartbeat struct {
@@ -40,7 +40,7 @@ type fieldIssue int
 
 const (
 	issueEmpty          fieldIssue = iota // a required string is ""
-	issueInvalidUnicode                   // node id is not lossless text
+	issueInvalidUnicode                   // node id or version is not lossless text
 	issueNotPositive                      // integer must be > 0
 	issueNegative                         // integer must be >= 0
 	issueMissingInstant                   // collected_at is the zero instant
@@ -55,7 +55,7 @@ type fieldValueError struct {
 
 // checkNodeIDValue holds the single node-id value rule: non-empty, valid
 // Unicode text. The raw-JSON boundary additionally checks the un-decoded
-// token (see validateRawNodeText); for a value already decoded from such a
+// token (see validateRawText); for a value already decoded from such a
 // token the Unicode branch can never fire, but both submit entries and the
 // stored-data read enforce the same rule through this one function.
 func checkNodeIDValue(node string) *fieldValueError {
@@ -68,11 +68,22 @@ func checkNodeIDValue(node string) *fieldValueError {
 	return nil
 }
 
-// checkNonEmptyString holds the single non-empty-string value rule, shared by
-// every field that uses it (currently version).
-func checkNonEmptyString(field, value string) *fieldValueError {
-	if value == "" {
-		return &fieldValueError{field: field, issue: issueEmpty}
+// checkVersionValue holds the single version value rule: non-empty, valid
+// Unicode text. The version is opaque text — Chinese, emoji and a literal "�"
+// the user typed are all legal, and no format (digits and dots) is imposed —
+// but it must be losslessly representable: a platform that silently rewrites
+// invalid bytes to U+FFFD would merge distinct versions into one and make the
+// version-skew judgement compare text the node never reported. The raw-JSON
+// boundary additionally checks the un-decoded token (see validateRawText);
+// for a value already decoded from such a token the Unicode branch can never
+// fire, but both submit entries and the stored-data read enforce the same
+// rule through this one function.
+func checkVersionValue(version string) *fieldValueError {
+	if version == "" {
+		return &fieldValueError{field: "version", issue: issueEmpty}
+	}
+	if !utf8.ValidString(version) {
+		return &fieldValueError{field: "version", issue: issueInvalidUnicode}
 	}
 	return nil
 }
@@ -115,7 +126,7 @@ func checkHeartbeatValues(h Heartbeat) *fieldValueError {
 	if e := checkPositiveInt("seq", h.Seq); e != nil {
 		return e
 	}
-	if e := checkNonEmptyString("version", h.Version); e != nil {
+	if e := checkVersionValue(h.Version); e != nil {
 		return e
 	}
 	if e := checkNonNegativeInt("height", h.Height); e != nil {
@@ -150,6 +161,8 @@ func (e *fieldValueError) directError() error {
 		return fmt.Errorf("node id is not valid Unicode text: contains invalid UTF-8")
 	case e.field == "seq":
 		return fmt.Errorf("seq must be a positive integer, got %d", e.value)
+	case e.field == "version" && e.issue == issueInvalidUnicode:
+		return fmt.Errorf("version is not valid Unicode text: contains invalid UTF-8")
 	case e.field == "version":
 		return fmt.Errorf("version is empty")
 	case e.field == "height":
@@ -173,6 +186,8 @@ func (e *fieldValueError) decodeError() error {
 		return fmt.Errorf("node must not be empty")
 	case e.field == "seq":
 		return fmt.Errorf("seq must be a positive integer, got %d", e.value)
+	case e.field == "version" && e.issue == issueInvalidUnicode:
+		return fmt.Errorf("version is not valid Unicode text: contains invalid UTF-8")
 	case e.field == "version":
 		return fmt.Errorf("version must not be empty")
 	case e.field == "height":
@@ -188,7 +203,7 @@ func (e *fieldValueError) decodeError() error {
 // file, prefixing the 1-based record position as stored-data errors do.
 func (e *fieldValueError) storedError(position int) error {
 	switch {
-	case e.field == "node" && e.issue == issueInvalidUnicode:
+	case (e.field == "node" || e.field == "version") && e.issue == issueInvalidUnicode:
 		return fmt.Errorf("record %d: field %q is not valid Unicode text", position, e.field)
 	case e.field == "node" || e.field == "version":
 		return fmt.Errorf("record %d: field %q must not be empty", position, e.field)
@@ -324,7 +339,7 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["node"], &h.NodeID); err != nil {
 		return Heartbeat{}, fmt.Errorf("node must be a string: %w", err)
 	}
-	if err := validateRawNodeText(fields["node"]); err != nil {
+	if err := validateRawText(fields["node"], "node"); err != nil {
 		return Heartbeat{}, err
 	}
 	if e := checkNodeIDValue(h.NodeID); e != nil {
@@ -360,7 +375,10 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	if err := json.Unmarshal(fields["version"], &h.Version); err != nil {
 		return Heartbeat{}, fmt.Errorf("version must be a string: %w", err)
 	}
-	if e := checkNonEmptyString("version", h.Version); e != nil {
+	if err := validateRawText(fields["version"], "version"); err != nil {
+		return Heartbeat{}, err
+	}
+	if e := checkVersionValue(h.Version); e != nil {
 		return Heartbeat{}, e.decodeError()
 	}
 
@@ -387,55 +405,59 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	return h, nil
 }
 
-// validateRawNodeText checks the raw JSON string token of the node field
-// before its decoded value is trusted. encoding/json silently rewrites
+// validateRawText checks the raw JSON string token of a text field (node or
+// version) before its decoded value is trusted. encoding/json silently rewrites
 // invalid UTF-8 bytes and unpaired \u surrogate escapes to U+FFFD, which
-// would merge distinct node ids into one replacement-char id and break the
-// ownership check against stored files. The raw token must decode
+// would merge distinct texts into one replacement-char value: distinct node
+// ids would collapse and break the ownership check against stored files, and
+// distinct versions would collapse into text the node never reported,
+// corrupting dedup and the version-skew judgement. The raw token must decode
 // losslessly: every literal byte sequence must be valid UTF-8, and every \u
 // escape must be a valid scalar value or a properly paired high/low
 // surrogate pair. A literal "�" (or its \uFFFD escape) is valid text the
-// user typed and is accepted; only undecodable input is rejected.
-func validateRawNodeText(raw json.RawMessage) error {
+// user typed and is accepted; only undecodable input is rejected. A \\
+// escape is consumed as a unit, so text that genuinely contains a backslash
+// followed by "u" and hex digits is never re-interpreted as an escape.
+func validateRawText(raw json.RawMessage, field string) error {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
-		return fmt.Errorf("node must be a string")
+		return fmt.Errorf("%s must be a string", field)
 	}
 	s := raw[1 : len(raw)-1]
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c == '\\' {
 			if i+1 >= len(s) {
-				return fmt.Errorf("node contains a truncated escape")
+				return fmt.Errorf("%s contains a truncated escape", field)
 			}
 			if s[i+1] != 'u' {
 				i += 2
 				continue
 			}
 			if i+6 > len(s) {
-				return fmt.Errorf("node contains a truncated \\u escape")
+				return fmt.Errorf("%s contains a truncated \\u escape", field)
 			}
 			r, err := parseHex4(s[i+2 : i+6])
 			if err != nil {
-				return fmt.Errorf("node contains an invalid \\u escape: %w", err)
+				return fmt.Errorf("%s contains an invalid \\u escape: %w", field, err)
 			}
 			switch {
 			case r >= 0xD800 && r <= 0xDBFF:
 				// A high surrogate is only valid when immediately followed
 				// by a low-surrogate \u escape.
 				if i+12 > len(s) || s[i+6] != '\\' || s[i+7] != 'u' {
-					return fmt.Errorf("node contains an unpaired high surrogate \\u%04X", r)
+					return fmt.Errorf("%s contains an unpaired high surrogate \\u%04X", field, r)
 				}
 				lo, err := parseHex4(s[i+8 : i+12])
 				if err != nil {
-					return fmt.Errorf("node contains an invalid \\u escape: %w", err)
+					return fmt.Errorf("%s contains an invalid \\u escape: %w", field, err)
 				}
 				if lo < 0xDC00 || lo > 0xDFFF {
-					return fmt.Errorf("node contains an unpaired high surrogate \\u%04X", r)
+					return fmt.Errorf("%s contains an unpaired high surrogate \\u%04X", field, r)
 				}
 				i += 12
 			case r >= 0xDC00 && r <= 0xDFFF:
-				return fmt.Errorf("node contains an unpaired low surrogate \\u%04X", r)
+				return fmt.Errorf("%s contains an unpaired low surrogate \\u%04X", field, r)
 			default:
 				i += 6
 			}
@@ -449,7 +471,7 @@ func validateRawNodeText(raw json.RawMessage) error {
 		// bytes are not valid UTF-8 (including surrogate encodings).
 		_, size := utf8.DecodeRune(s[i:])
 		if size == 1 {
-			return fmt.Errorf("node contains invalid UTF-8 at byte offset %d", i)
+			return fmt.Errorf("%s contains invalid UTF-8 at byte offset %d", field, i)
 		}
 		i += size
 	}
