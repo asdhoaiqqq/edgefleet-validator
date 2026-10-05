@@ -188,15 +188,6 @@ func loadNodeFile(path string) (*nodeFile, error) {
 // field is an error naming the record and field rather than a zero value.
 // Whitespace and key ordering carry no meaning and never cause a failure.
 func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("invalid JSON: file must be a JSON object")
-	}
-
 	var (
 		format   string
 		checksum string
@@ -206,60 +197,47 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 		seenChecksum bool
 		seenRecords  bool
 	)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil, fmt.Errorf("invalid JSON: %w", err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil, fmt.Errorf("invalid JSON: envelope field name must be a string")
-		}
-		var val json.RawMessage
-		if err := dec.Decode(&val); err != nil {
-			return nil, fmt.Errorf("invalid value for envelope field %q: %w", key, err)
-		}
+
+	// The null/type/unknown-key checks stay inline in document order, as
+	// before; readStrictJSONObject owns the shared one-object reading rule
+	// (a decoded key name appears at most once, and a Unicode-escaped
+	// spelling of the same key still collides) and renders the envelope's
+	// wording.
+	visit := func(key string, val json.RawMessage) error {
 		switch key {
 		case "format":
-			if seenFormat {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
 			seenFormat = true
 			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &format); err != nil {
-				return nil, fmt.Errorf("format must be a string: %w", err)
+				return fmt.Errorf("format must be a string: %w", err)
 			}
 		case "checksum":
-			if seenChecksum {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
 			seenChecksum = true
 			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &checksum); err != nil {
-				return nil, fmt.Errorf("checksum must be a string: %w", err)
+				return fmt.Errorf("checksum must be a string: %w", err)
 			}
 		case "records":
-			if seenRecords {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
 			seenRecords = true
 			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &records); err != nil {
-				return nil, fmt.Errorf("records must be an array of heartbeat objects: %w", err)
+				return fmt.Errorf("records must be an array of heartbeat objects: %w", err)
 			}
 		default:
-			return nil, fmt.Errorf("unknown envelope field %q", key)
+			return fmt.Errorf("unknown envelope field %q", key)
 		}
+		return nil
 	}
-	// Consume the closing brace.
-	if _, err := dec.Token(); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := readStrictJSONObject(dec, envelopeObjectWording(), visit); err != nil {
+		return nil, err
 	}
 	// Nothing may follow the single envelope object.
 	if _, err := dec.Token(); err != io.EOF {

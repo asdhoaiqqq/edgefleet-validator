@@ -283,41 +283,16 @@ func rejectNull(raw json.RawMessage, field string) error {
 // occurrence and let an absent field masquerade as the zero value. Both the
 // submit input path and the stored-file read path must use it.
 func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
-	// Walk the object with a streaming decoder so duplicate field names are
-	// detected. Field names are compared as the JSON string they represent:
-	// "missed" and "m\u0069ssed" are the same field. A map-based unmarshal
-	// would silently keep only the last occurrence.
+	// readStrictJSONObject owns the shared one-object reading rule: decoded
+	// key names are compared as the JSON strings they denote (see the key
+	// comparison explanation just above), a repeat is rejected before any
+	// value is trusted, and each value is captured raw. Presence, unknown
+	// fields and value rules remain specific to this object and are checked
+	// below in their established order.
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	tok, err := dec.Token()
+	fields, err := readStrictJSONObject(dec, recordObjectWording(), nil)
 	if err != nil {
-		return Heartbeat{}, fmt.Errorf("record must be a JSON object: %w", err)
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return Heartbeat{}, fmt.Errorf("record must be a JSON object")
-	}
-
-	fields := make(map[string]json.RawMessage)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return Heartbeat{}, fmt.Errorf("invalid field: %w", err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return Heartbeat{}, fmt.Errorf("field name must be a string")
-		}
-		if _, exists := fields[key]; exists {
-			return Heartbeat{}, fmt.Errorf("duplicate field %q", key)
-		}
-		var val json.RawMessage
-		if err := dec.Decode(&val); err != nil {
-			return Heartbeat{}, fmt.Errorf("invalid value for field %q: %w", key, err)
-		}
-		fields[key] = val
-	}
-	// Consume the closing brace.
-	if _, err := dec.Token(); err != nil {
-		return Heartbeat{}, fmt.Errorf("invalid record: %w", err)
+		return Heartbeat{}, err
 	}
 
 	for _, f := range heartbeatFields {
