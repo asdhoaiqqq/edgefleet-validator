@@ -347,8 +347,17 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 	// already delivered lines. The buffer is compacted and grown like
 	// bufio.Scanner's, so a long unterminated line is bounded by
 	// maxAggregateLineBytes instead of growing without limit.
+	//
+	// searchFrom is the earliest absolute index not yet inspected for a '\n':
+	// every byte before it has either been delivered or searched already. A
+	// Read can only introduce a newline in the bytes it just appended, so the
+	// pending tail of a long line is never rescanned; scanning, compaction and
+	// growth together stay linear in the cumulative byte count even when each
+	// Read brings a single byte. searchFrom >= start always holds, and
+	// compaction/growth shift every absolute index by the same start they do.
 	buf := make([]byte, 64*1024)
 	start, end := 0, 0
+	searchFrom := 0
 	lineNo := 0
 	emptyReads := 0
 	deliver := func(b []byte) error {
@@ -362,6 +371,10 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 		if start > 0 && (end == len(buf) || start > len(buf)/2) {
 			copy(buf, buf[start:end])
 			end -= start
+			searchFrom -= start
+			if searchFrom < 0 {
+				searchFrom = 0
+			}
 			start = 0
 		}
 		if end == len(buf) {
@@ -377,6 +390,10 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 			copy(grown, buf[start:end])
 			buf = grown
 			end -= start
+			searchFrom -= start
+			if searchFrom < 0 {
+				searchFrom = 0
+			}
 			start = 0
 		}
 		n, readErr := r.Read(buf[end:])
@@ -385,16 +402,23 @@ func readAggregateLines(r io.Reader, handle func(line string, lineNo int) error)
 			return errAggregateBadReadCount
 		}
 		end += n
-		for {
-			i := bytes.IndexByte(buf[start:end], '\n')
+		// Only this Read's newly appended bytes can still hold an unseen
+		// newline; search from searchFrom rather than from start, so a long
+		// line delivered a few bytes at a time costs one scan of each byte
+		// instead of one scan per Read over the whole accumulated tail.
+		for searchFrom < end {
+			i := bytes.IndexByte(buf[searchFrom:end], '\n')
 			if i < 0 {
 				break
 			}
-			if err := deliver(buf[start : start+i]); err != nil {
+			idx := searchFrom + i
+			if err := deliver(buf[start:idx]); err != nil {
 				return err
 			}
-			start += i + 1
+			start = idx + 1
+			searchFrom = start
 		}
+		searchFrom = end
 		if readErr != nil {
 			if readErr == io.EOF {
 				// Clean end of input: a trailing line without a newline is a
