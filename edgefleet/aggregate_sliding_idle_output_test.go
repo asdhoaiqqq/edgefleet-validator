@@ -66,6 +66,26 @@ func (w *prefixFailAtWriter) Write(p []byte) (int, error) {
 	return w.got.Write(p)
 }
 
+// fullErrWriter accepts every write in full, buffering the bytes, but its
+// failAt-th call still reports err alongside the complete byte count: the
+// receiver holds the whole record -- every JSON byte and the trailing
+// newline -- yet the write is a failure.
+type fullErrWriter struct {
+	calls  int
+	failAt int
+	err    error
+	got    bytes.Buffer
+}
+
+func (w *fullErrWriter) Write(p []byte) (int, error) {
+	w.calls++
+	w.got.Write(p)
+	if w.calls == w.failAt {
+		return len(p), w.err
+	}
+	return len(p), nil
+}
+
 // shortFailAtWriter buffers full writes until its failAt-th call, which
 // accepts only accept bytes and reports no error.
 type shortFailAtWriter struct {
@@ -185,5 +205,96 @@ func TestPartitionedSlidingIdleBatchShortWriteFailure(t *testing.T) {
 	}
 	if out.calls != 2 {
 		t.Errorf("writer was called %d times, want exactly 2 (rest of the batch never written)", out.calls)
+	}
+}
+
+// A writer that accepts a window result in full -- every JSON byte and the
+// trailing newline -- but still returns an error has failed the write: the
+// complete byte count cannot cancel the error. When the idle declaration's
+// very first result fails this way the run stops at once with an
+// *OutputError on the idle declaration's physical line (blank lines count),
+// the receiver keeps the fully written record it already holds, the record
+// is not deleted or resent, and no other window of the batch is written.
+// Records after the idle line -- watermarks that would close the still-open
+// [1200,2200) window and a malformed line -- are never processed, so the
+// open window is not flushed at end of input and no later input error can
+// replace the output failure.
+func TestPartitionedSlidingIdleBatchFullWriteThenErrorFails(t *testing.T) {
+	lines := append(append([]string{}, slidingIdleBatchLines...),
+		`{"type":"watermark","time":3000,"partition":0}`, // line 13: must not be reached
+		`{"type":"watermark","time":3000,"partition":1}`, // line 14: would close [1200,2200); must not be reached
+		`not json`, // line 15: must not be reached
+	)
+	out := &fullErrWriter{failAt: 1, err: errSentinelOutput}
+	err := RunAggregatePartitionedSliding(strings.NewReader(strings.Join(lines, "\n")), 1000, 600, 2, out, &bytes.Buffer{})
+
+	var oe *OutputError
+	if !errors.As(err, &oe) {
+		t.Fatalf("expected *OutputError, got %T: %v (a complete write cannot cancel the writer's error)", err, err)
+	}
+	if oe.Line != 12 {
+		t.Errorf("Line = %d, want 12 (the idle declaration; blank lines count)", oe.Line)
+	}
+	if oe.Kind != "window result" {
+		t.Errorf("Kind = %q, want %q", oe.Kind, "window result")
+	}
+	wantDetail := `key "a" window [0,1000)`
+	if !strings.Contains(err.Error(), wantDetail) {
+		t.Errorf("error %q must identify %s", err.Error(), wantDetail)
+	}
+	if !errors.Is(err, errSentinelOutput) {
+		t.Errorf("errors.Is must expose the writer's original error, got %v", err)
+	}
+	if errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("a complete write must not be reported as io.ErrShortWrite, got %v", err)
+	}
+
+	wantWritten := slidingIdleBatchOutput[0] + "\n"
+	if out.got.String() != wantWritten {
+		t.Errorf("retained content = %q, want exactly the fully written first result %q", out.got.String(), wantWritten)
+	}
+	if out.calls != 1 {
+		t.Errorf("writer was called %d times, want exactly 1 (no resend, no later windows)", out.calls)
+	}
+}
+
+// The same rule when the fully-written-but-failed result sits in the middle
+// of the idle-triggered batch: the merged per-key results written before it
+// and the failed result itself all stay in the receiver exactly once and in
+// batch order, the failed record is not resent, and the remaining windows of
+// the batch are never written.
+func TestPartitionedSlidingIdleBatchFullWriteThenErrorMidBatch(t *testing.T) {
+	lines := append(append([]string{}, slidingIdleBatchLines...),
+		`{"type":"watermark","time":3000,"partition":0}`, // line 13: must not be reached
+		`{"type":"watermark","time":3000,"partition":1}`, // line 14: would close [1200,2200); must not be reached
+		`not json`, // line 15: must not be reached
+	)
+	out := &fullErrWriter{failAt: 4, err: errSentinelOutput}
+	err := RunAggregatePartitionedSliding(strings.NewReader(strings.Join(lines, "\n")), 1000, 600, 2, out, &bytes.Buffer{})
+
+	var oe *OutputError
+	if !errors.As(err, &oe) {
+		t.Fatalf("expected *OutputError, got %T: %v", err, err)
+	}
+	if oe.Line != 12 || oe.Kind != "window result" {
+		t.Errorf("got Kind=%q Line=%d, want window result at line 12", oe.Kind, oe.Line)
+	}
+	wantDetail := `key "a" window [600,1600)`
+	if !strings.Contains(err.Error(), wantDetail) {
+		t.Errorf("error %q must identify %s", err.Error(), wantDetail)
+	}
+	if !errors.Is(err, errSentinelOutput) {
+		t.Errorf("errors.Is must expose the writer's original error, got %v", err)
+	}
+	if errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("a complete write must not be reported as io.ErrShortWrite, got %v", err)
+	}
+
+	wantWritten := strings.Join(slidingIdleBatchOutput[:4], "\n") + "\n"
+	if out.got.String() != wantWritten {
+		t.Errorf("retained content = %q, want the three earlier results plus the fully written failed result %q", out.got.String(), wantWritten)
+	}
+	if out.calls != 4 {
+		t.Errorf("writer was called %d times, want exactly 4 (no resend, no later windows)", out.calls)
 	}
 }
