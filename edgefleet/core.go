@@ -32,14 +32,17 @@ const missedAboveToleranceFinding = "missed duties above tolerance"
 // whether the latest telemetry is fresh (a version skew or missed-duty excess
 // never makes a node offline), and the version is compared as the exact text
 // the node reported, with no format imposed and no trimming or case folding.
-// Findings come back in the canonical order: offline first, then version skew.
+// The skew comparison uses the raw versions; only the finding text renders
+// them through the shared DisplayText rule so whitespace or control
+// characters in either version cannot break the health output. Findings come
+// back in the canonical order: offline first, then version skew.
 func livenessVersionFindings(online bool, version, expectedVersion string) []string {
 	var findings []string
 	if !online {
 		findings = append(findings, "offline")
 	}
 	if version != expectedVersion {
-		findings = append(findings, "version skew: "+version+" != "+expectedVersion)
+		findings = append(findings, "version skew: "+DisplayText(version)+" != "+DisplayText(expectedVersion))
 	}
 	return findings
 }

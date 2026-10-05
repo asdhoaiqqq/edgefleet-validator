@@ -237,12 +237,20 @@ func cmdHealth(args []string) {
 	}
 
 	if result.Status == "notelemetry" {
-		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", result.NodeID)
+		// The node id goes through the same terminal-safe display rule as the
+		// health line: a newline-bearing id stays inside the quoted node value
+		// instead of starting a forged second line.
+		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", edgefleet.DisplayText(result.NodeID))
 		return
 	}
+	// Node id and version are arbitrary legal Unicode text, so they are
+	// rendered with the shared DisplayText rule: plain text unchanged, while
+	// whitespace, quotes, backslashes and control characters appear inside a
+	// quoted JSON string rather than splitting or reflowing the line. The
+	// version-skew finding renders its two versions the same way.
 	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
-		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
-		result.Version, result.Height, result.Missed, result.Findings)
+		edgefleet.DisplayText(result.NodeID), result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
+		edgefleet.DisplayText(result.Version), result.Height, result.Missed, result.Findings)
 	if isFlagPassed(fs, "missed-since-seq") {
 		// missed above stays cumulative; this line states the alarm basis.
 		if result.NewMissedKnown {
