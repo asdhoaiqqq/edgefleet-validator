@@ -739,6 +739,114 @@ func TestCLISubmitValidUnicodeNodeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCLISubmitRejectsInvalidVersionText exercises the user-visible
+// contract for version text at the submit entry point: an invalid UTF-8
+// byte or an unpaired surrogate escape in version must fail non-zero,
+// print no success counts, and name the record position and the version
+// field on stderr; the valid record in the same batch is not saved.
+func TestCLISubmitRejectsInvalidVersionText(t *testing.T) {
+	f := newFixture(t)
+	monoBefore := readNodeFile(t, f.dir, "mono")
+
+	cases := []struct {
+		name       string
+		versionRaw string
+	}{
+		{"invalid utf-8 bytes", `"1.26.0-` + "\xff" + `"`},
+		{"unpaired high surrogate", `"1.26.0-` + `\uD83D` + `"`},
+		{"unpaired low surrogate", `"1.26.0-` + `\uDE00` + `"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			badRecord := `{"node":"valbad","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":` +
+				tc.versionRaw + `,"height":1,"missed":0}`
+			goodRecord := `{"node":"mono","seq":4,"collected_at":"2026-10-01T11:59:59Z","version":"1.26.0","height":104,"missed":15}`
+			out, errOut, code := runCLI(t, f.dir, "["+goodRecord+","+badRecord+"]",
+				"heartbeat", "submit", "--data-dir", f.dir, "--receive-time", cliReceiveAt)
+			if code == 0 {
+				t.Errorf("submit with invalid version text must exit non-zero; stdout=%q", out)
+			}
+			if strings.Contains(out, "submitted") {
+				t.Errorf("rejected batch must not print success counts, stdout=%q", out)
+			}
+			if !strings.Contains(errOut, "record 2") || !strings.Contains(errOut, "version") {
+				t.Errorf("stderr must name the failing record (record 2) and the version field, got %q", errOut)
+			}
+
+			// The valid record in the same batch is not saved either.
+			if got := readNodeFile(t, f.dir, "mono"); got != monoBefore {
+				t.Errorf("existing node file changed during rejected submit")
+			}
+			if _, err := os.Stat(nodeFileHexPath(f.dir, "valbad")); !os.IsNotExist(err) {
+				t.Errorf("no node file may be created for the invalid batch, stat err=%v", err)
+			}
+		})
+	}
+
+	// Health answers for the existing node are unchanged.
+	out, _, code := health(t, f,
+		"--node", "mono", "--expected-version", "1.26.0", "--tolerated-misses", "9")
+	if code != 0 || !strings.Contains(out, "seq=3") {
+		t.Errorf("health after rejected batches changed: code=%d out=%q", code, out)
+	}
+}
+
+// TestCLISubmitValidUnicodeVersionRoundTrip checks the legal cases keep
+// working end to end: Chinese and emoji version text, a literal
+// replacement character, an emoji written as a surrogate pair counting
+// as the same version as its literal form, and a version containing a
+// real backslash which is never re-interpreted as an escape. No numeric
+// version format is imposed; health keeps comparing versions exactly.
+func TestCLISubmitValidUnicodeVersionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	// Chinese version accepted and queried back verbatim.
+	out, _, code := submit(t, dir,
+		`[{"node":"甲","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"版本 1.0","height":1,"missed":0}]`)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("Chinese version must be accepted: code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, dir, "",
+		"heartbeat", "history", "--data-dir", dir, "--node", "甲")
+	if code != 0 || !strings.Contains(out, "version=版本 1.0") {
+		t.Errorf("Chinese version must round-trip exactly: code=%d out=%q", code, out)
+	}
+
+	// Emoji as a surrogate pair is a new record; the literal emoji is
+	// the same version and counts as a duplicate.
+	out, _, code = submit(t, dir,
+		`[{"node":"e","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"v-😀","height":2,"missed":0}]`)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("surrogate-pair emoji version must be accepted: code=%d out=%q", code, out)
+	}
+	out, _, code = submit(t, dir,
+		`[{"node":"e","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"v-😀","height":2,"missed":0}]`)
+	if code != 0 || !strings.Contains(out, "new=0 duplicate=1") {
+		t.Errorf("literal emoji must be the same version: code=%d out=%q", code, out)
+	}
+
+	// A literal replacement character is genuine text the user typed.
+	out, _, code = submit(t, dir,
+		`[{"node":"r","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.0-�","height":1,"missed":0}]`)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("literal replacement char must be accepted: code=%d out=%q", code, out)
+	}
+
+	// A version containing a real backslash is stored literally and not
+	// decoded a second time: health expects the literal text exactly.
+	out, _, code = submit(t, dir,
+		`[{"node":"b","seq":1,"collected_at":"2026-10-01T11:59:59Z","version":"1.0\\u0062eta","height":1,"missed":0}]`)
+	if code != 0 || !strings.Contains(out, "new=1") {
+		t.Fatalf("literal-backslash version must be accepted: code=%d out=%q", code, out)
+	}
+	out, _, code = runCLI(t, dir, "",
+		"heartbeat", "health", "--data-dir", dir, "--at", cliQueryAt,
+		"--node", "b", "--expected-version", "1.0\\u0062eta", "--tolerated-misses", "0")
+	if code != 0 || strings.Contains(out, "version skew") {
+		t.Errorf("literal-backslash version must compare exactly: code=%d out=%q", code, out)
+	}
+}
+
 // submit runs one submit command and returns its full result for inspection.
 func submit(t *testing.T, dir, json string) (string, string, int) {
 	t.Helper()
