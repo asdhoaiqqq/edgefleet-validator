@@ -20,21 +20,38 @@ type Health struct {
 	Findings []string
 }
 
+// missedAboveToleranceFinding is the single alarm text emitted when a
+// missed-duty count strictly exceeds the tolerance. The counted quantity
+// differs per query path — the latest cumulative counter for Evaluate and
+// plain health queries, the baseline-relative increase for HealthSince — but
+// the alarm wording is shared.
+const missedAboveToleranceFinding = "missed duties above tolerance"
+
+// livenessVersionFindings holds the single online and version-skew judgement
+// shared by Evaluate and both store health query paths: online reflects only
+// whether the latest telemetry is fresh (a version skew or missed-duty excess
+// never makes a node offline), and the version is compared as the exact text
+// the node reported, with no format imposed and no trimming or case folding.
+// Findings come back in the canonical order: offline first, then version skew.
+func livenessVersionFindings(online bool, version, expectedVersion string) []string {
+	var findings []string
+	if !online {
+		findings = append(findings, "offline")
+	}
+	if version != expectedVersion {
+		findings = append(findings, "version skew: "+version+" != "+expectedVersion)
+	}
+	return findings
+}
+
 // Evaluate checks liveness, version skew and missed duties.
 func Evaluate(node Node, expectedVersion string, toleratedMisses int) Health {
 	health := Health{Node: node.ID, Healthy: true}
-	if !node.Online {
-		health.Healthy = false
-		health.Findings = append(health.Findings, "offline")
-	}
-	if node.Version != expectedVersion {
-		health.Healthy = false
-		health.Findings = append(health.Findings, "version skew: "+node.Version+" != "+expectedVersion)
-	}
+	health.Findings = livenessVersionFindings(node.Online, node.Version, expectedVersion)
 	if node.Missed > toleratedMisses {
-		health.Healthy = false
-		health.Findings = append(health.Findings, "missed duties above tolerance")
+		health.Findings = append(health.Findings, missedAboveToleranceFinding)
 	}
+	health.Healthy = len(health.Findings) == 0
 	return health
 }
 

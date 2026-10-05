@@ -559,14 +559,6 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 	age := at.Sub(latest.CollectedAt)
 	online := age <= onlineWindow
 
-	findings := []string{}
-	if !online {
-		findings = append(findings, "offline")
-	}
-	if latest.Version != expectedVersion {
-		findings = append(findings, "version skew: "+latest.Version+" != "+expectedVersion)
-	}
-
 	result := HealthResult{
 		NodeID:      nodeID,
 		Status:      "online",
@@ -582,7 +574,8 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 
 	if !useBaseline {
 		// Cumulative judgement: the current counter must strictly exceed the
-		// tolerance (mirrors Evaluate for callers that do not use a baseline).
+		// tolerance. Evaluate holds this rule — and the shared online/version
+		// rules — in exactly one place for the demo and both query paths.
 		node := Node{
 			ID:      nodeID,
 			Version: latest.Version,
@@ -593,6 +586,12 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 		result.Findings = Evaluate(node, expectedVersion, toleratedMisses).Findings
 		return result, nil
 	}
+
+	// Baseline judgement: the online and version-skew findings come from the
+	// same shared rules as the cumulative query above; only the missed-duty
+	// statistic differs — it counts duties missed after the baseline record
+	// instead of the latest cumulative total.
+	findings := append([]string{}, livenessVersionFindings(online, latest.Version, expectedVersion)...)
 
 	baselineIdx := -1
 	for i, r := range records {
@@ -629,7 +628,7 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 		// backwards within int64 range; the difference stays exact.
 		result.NewMissed = latest.Missed - baseline.Missed
 		if result.NewMissed > int64(toleratedMisses) {
-			findings = append(findings, "missed duties above tolerance")
+			findings = append(findings, missedAboveToleranceFinding)
 		}
 	}
 	result.Findings = findings
