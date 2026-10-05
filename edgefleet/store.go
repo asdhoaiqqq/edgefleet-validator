@@ -182,8 +182,9 @@ func loadNodeFile(path string) (*nodeFile, error) {
 // decodeStrictNodeFile parses the on-disk envelope without letting
 // encoding/json defaults hide missing or duplicated data. The envelope has
 // exactly three keys — format, checksum, records — each present, non-null and
-// written once (a Unicode-escaped spelling of the same key still collides),
-// and no other keys. Every element of records is decoded with
+// written once; the uniqueness judgement is the shared objectFields rule, so
+// a Unicode-escaped spelling of the same key collides exactly as it does in a
+// submitted heartbeat object. Every element of records is decoded with
 // decodeStrictHeartbeatObject, so a missing, null or duplicated telemetry
 // field is an error naming the record and field rather than a zero value.
 // Whitespace and key ordering carry no meaning and never cause a failure.
@@ -201,11 +202,8 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 		format   string
 		checksum string
 		records  []json.RawMessage
-
-		seenFormat   bool
-		seenChecksum bool
-		seenRecords  bool
 	)
+	fields := objectFields{}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -219,12 +217,11 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 		if err := dec.Decode(&val); err != nil {
 			return nil, fmt.Errorf("invalid value for envelope field %q: %w", key, err)
 		}
+		if fields.check(key) {
+			return nil, fmt.Errorf("duplicate envelope field %q", key)
+		}
 		switch key {
 		case "format":
-			if seenFormat {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
-			seenFormat = true
 			if bytes.Equal(val, []byte("null")) {
 				return nil, fmt.Errorf("envelope field %q must not be null", key)
 			}
@@ -232,10 +229,6 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 				return nil, fmt.Errorf("format must be a string: %w", err)
 			}
 		case "checksum":
-			if seenChecksum {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
-			seenChecksum = true
 			if bytes.Equal(val, []byte("null")) {
 				return nil, fmt.Errorf("envelope field %q must not be null", key)
 			}
@@ -243,10 +236,6 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 				return nil, fmt.Errorf("checksum must be a string: %w", err)
 			}
 		case "records":
-			if seenRecords {
-				return nil, fmt.Errorf("duplicate envelope field %q", key)
-			}
-			seenRecords = true
 			if bytes.Equal(val, []byte("null")) {
 				return nil, fmt.Errorf("envelope field %q must not be null", key)
 			}
@@ -269,13 +258,13 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	if !seenFormat {
+	if !fields.has("format") {
 		return nil, fmt.Errorf("missing required envelope field %q", "format")
 	}
-	if !seenChecksum {
+	if !fields.has("checksum") {
 		return nil, fmt.Errorf("missing required envelope field %q", "checksum")
 	}
-	if !seenRecords {
+	if !fields.has("records") {
 		return nil, fmt.Errorf("missing required envelope field %q", "records")
 	}
 
