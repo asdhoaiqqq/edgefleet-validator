@@ -140,6 +140,11 @@ func heartbeatUsage() {
 	fmt.Println("  累计漏签数回退 finding is reported; the baseline must name an existing")
 	fmt.Println("  saved seq, otherwise the command fails.")
 	fmt.Println()
+	fmt.Println("  In health output, a node id or version containing whitespace, quotes,")
+	fmt.Println("  backslashes or control characters is shown as a quoted JSON string")
+	fmt.Println("  (newlines as \\n, tabs as \\t, other control characters as \\uXXXX),")
+	fmt.Println("  so every result stays on its own line; the stored text is unchanged.")
+	fmt.Println()
 	fmt.Println("  history  --node ID             node id (required)")
 	fmt.Println("           --data-dir DIR        data directory")
 	fmt.Println()
@@ -236,13 +241,18 @@ func cmdHealth(args []string) {
 		die("%v", err)
 	}
 
+	// Node id and version go through the shared display rule: text that would
+	// break the one-line format (newlines, tabs, quotes, backslashes, control
+	// characters) is shown as a quoted JSON string, so a health query always
+	// prints exactly one line — two with a missed-duty baseline — and node
+	// text can never masquerade as extra fields or a second result line.
 	if result.Status == "notelemetry" {
-		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", result.NodeID)
+		fmt.Printf("node=%s status=无遥测 findings=[无遥测]\n", edgefleet.DisplayText(result.NodeID))
 		return
 	}
 	fmt.Printf("node=%s status=%s seq=%d collected_at=%s version=%s height=%d missed=%d findings=%v\n",
-		result.NodeID, result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
-		result.Version, result.Height, result.Missed, result.Findings)
+		edgefleet.DisplayText(result.NodeID), result.Status, result.Seq, result.CollectedAt.Format(time.RFC3339),
+		edgefleet.DisplayText(result.Version), result.Height, result.Missed, result.Findings)
 	if isFlagPassed(fs, "missed-since-seq") {
 		// missed above stays cumulative; this line states the alarm basis.
 		if result.NewMissedKnown {
