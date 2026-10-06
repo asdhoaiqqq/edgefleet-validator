@@ -39,11 +39,14 @@ var heartbeatFields = []string{"node", "seq", "collected_at", "version", "height
 type fieldIssue int
 
 const (
-	issueEmpty          fieldIssue = iota // a required string is ""
-	issueInvalidUnicode                   // node id or version is not lossless text
-	issueNotPositive                      // integer must be > 0
-	issueNegative                         // integer must be >= 0
-	issueMissingInstant                   // collected_at is the zero instant
+	issueEmpty            fieldIssue = iota // a required string is ""
+	issueInvalidUnicode                     // node id or version is not lossless text
+	issueNotPositive                        // integer must be > 0
+	issueNegative                           // integer must be >= 0
+	issueMissingInstant                     // collected_at is the zero instant
+	issueYearOutOfRange                     // collected_at year is outside 0000..9999
+	issueOffsetOutOfRange                   // collected_at zone offset is outside -23:59..+23:59
+	issueOffsetSeconds                      // collected_at zone offset is not a whole minute
 )
 
 // fieldValueError names the field whose value rule was violated.
@@ -105,14 +108,38 @@ func checkNonNegativeInt(field string, value int64) *fieldValueError {
 	return nil
 }
 
-// checkCollectedAtValue holds the single rule that a collection instant must
-// actually be present (not the zero time).
+// checkCollectedAtValue holds the single set of rules a collection instant
+// must satisfy at every trust boundary. Beyond being present (not the zero
+// time), the instant must be losslessly representable in the on-disk format:
+// a four-digit year (0000..9999, the only years RFC3339Nano writes) and a
+// zone offset the minute-granular RFC3339 text can keep exactly — whole
+// minutes and no larger in magnitude than 23:59. A seconds-bearing offset
+// (possible only on the direct Go submit entry) would otherwise be saved as
+// a different instant, and an out-of-range year or offset only fails at
+// marshal time, after other nodes in the batch were already written.
 func checkCollectedAtValue(collected time.Time) *fieldValueError {
 	if collected.IsZero() {
 		return &fieldValueError{field: "collected_at", issue: issueMissingInstant}
 	}
+	year := collected.Year()
+	if year < 0 || year > 9999 {
+		return &fieldValueError{field: "collected_at", issue: issueYearOutOfRange, value: int64(year)}
+	}
+	_, offset := collected.Zone()
+	if offset < -maxZoneOffsetSeconds || offset > maxZoneOffsetSeconds {
+		return &fieldValueError{field: "collected_at", issue: issueOffsetOutOfRange, value: int64(offset)}
+	}
+	if offset%60 != 0 {
+		return &fieldValueError{field: "collected_at", issue: issueOffsetSeconds, value: int64(offset)}
+	}
 	return nil
 }
+
+// maxZoneOffsetSeconds is the largest zone offset magnitude accepted in a
+// collected_at value: 23 hours 59 minutes. Hours 00..23 and minutes 00..59
+// are exactly the fields the RFC3339 suffix carries; +24:00 and -24:00 are
+// out of range, and +00:60 is not folded into +01:00.
+const maxZoneOffsetSeconds = 23*3600 + 59*60
 
 // checkHeartbeatValues runs every context-free field-value rule in the single
 // rejection order shared by the direct-submit and stored-data boundaries:
@@ -151,6 +178,24 @@ func checkCollectedAtTiming(collected, receiveTime time.Time) error {
 	return nil
 }
 
+// formatZoneOffset renders an offset in seconds as the RFC3339 suffix shape
+// +HH:MM, or +HH:MM:SS when the offset carries seconds. Hours are not rolled
+// over (an out-of-range +24:00 is shown as +24:00), so the message shows
+// exactly the offset the caller supplied.
+func formatZoneOffset(sec int64) string {
+	sign := '+'
+	if sec < 0 {
+		sign = '-'
+		sec = -sec
+	}
+	h := sec / 3600
+	m := sec % 3600 / 60
+	if s := sec % 60; s != 0 {
+		return fmt.Sprintf("%c%02d:%02d:%02d", sign, h, m, s)
+	}
+	return fmt.Sprintf("%c%02d:%02d", sign, h, m)
+}
+
 // directError renders a field rule failure in ValidateHeartbeat's wording,
 // used when a caller submits an already constructed Heartbeat.
 func (e *fieldValueError) directError() error {
@@ -169,6 +214,14 @@ func (e *fieldValueError) directError() error {
 		return fmt.Errorf("height must be >= 0, got %d", e.value)
 	case e.field == "missed":
 		return fmt.Errorf("missed must be >= 0, got %d", e.value)
+	case e.field == "collected_at" && e.issue == issueYearOutOfRange:
+		return fmt.Errorf("collected_at year %d is outside the supported range 0000..9999", e.value)
+	case e.field == "collected_at" && e.issue == issueOffsetOutOfRange:
+		return fmt.Errorf("collected_at timezone offset %s is outside the allowed range -23:59..+23:59",
+			formatZoneOffset(e.value))
+	case e.field == "collected_at" && e.issue == issueOffsetSeconds:
+		return fmt.Errorf("collected_at timezone offset %s carries seconds; offsets must be whole minutes",
+			formatZoneOffset(e.value))
 	case e.field == "collected_at":
 		return fmt.Errorf("collected_at is missing or invalid")
 	default:
@@ -194,9 +247,58 @@ func (e *fieldValueError) decodeError() error {
 		return fmt.Errorf("height must be >= 0, got %d", e.value)
 	case e.field == "missed":
 		return fmt.Errorf("missed must be >= 0, got %d", e.value)
+	case e.field == "collected_at" && e.issue == issueYearOutOfRange:
+		return fmt.Errorf("collected_at year %d is outside the supported range 0000..9999", e.value)
+	case e.field == "collected_at" && e.issue == issueOffsetOutOfRange:
+		return fmt.Errorf("collected_at timezone offset %s is outside the allowed range -23:59..+23:59",
+			formatZoneOffset(e.value))
+	case e.field == "collected_at" && e.issue == issueOffsetSeconds:
+		return fmt.Errorf("collected_at timezone offset %s carries seconds; offsets must be whole minutes",
+			formatZoneOffset(e.value))
 	default:
 		return fmt.Errorf("invalid value for field %q", e.field)
 	}
+}
+
+// checkCollectedAtText validates the literal timezone suffix of an
+// RFC3339-accepted collected_at string before the parsed time.Time is
+// trusted. time.Parse accepts +24:00 (carrying the raw 86400-second offset
+// into the time) and folds +00:60 into +01:00; both hide a value the save
+// format cannot represent, and folding changes which instant was reported.
+// The suffix is checked as written — hours 00..23, minutes 00..59 — so an
+// out-of-range part is reported, never normalized into a legal offset. "Z"
+// means UTC and has no numeric suffix to check.
+func checkCollectedAtText(collectedStr string) error {
+	if len(collectedStr) < 6 {
+		return nil
+	}
+	suffix := collectedStr[len(collectedStr)-6:]
+	if suffix[0] != '+' && suffix[0] != '-' {
+		return nil
+	}
+	hour, okHour := twoDigits(suffix[1:3])
+	minute, okMin := twoDigits(suffix[4:6])
+	if !okHour || suffix[3] != ':' || !okMin {
+		return nil
+	}
+	if hour > 23 {
+		return fmt.Errorf("collected_at timezone offset %q is outside the allowed range -23:59..+23:59",
+			suffix)
+	}
+	if minute > 59 {
+		return fmt.Errorf("collected_at timezone offset %q has minute %02d; offset minutes must be 00..59",
+			suffix, minute)
+	}
+	return nil
+}
+
+// twoDigits parses exactly two ASCII decimal digits without any other
+// interpretation.
+func twoDigits(b string) (int, bool) {
+	if len(b) != 2 || b[0] < '0' || b[0] > '9' || b[1] < '0' || b[1] > '9' {
+		return 0, false
+	}
+	return int(b[0]-'0')*10 + int(b[1]-'0'), true
 }
 
 // storedError renders a field rule failure for a record read from a saved
@@ -211,6 +313,14 @@ func (e *fieldValueError) storedError(position int) error {
 		return fmt.Errorf("record %d: field %q must be a positive integer, got %d", position, e.field, e.value)
 	case e.field == "height" || e.field == "missed":
 		return fmt.Errorf("record %d: field %q must be >= 0, got %d", position, e.field, e.value)
+	case e.field == "collected_at" && e.issue == issueYearOutOfRange:
+		return fmt.Errorf("record %d: field %q year %d is outside the supported range 0000..9999", position, e.field, e.value)
+	case e.field == "collected_at" && e.issue == issueOffsetOutOfRange:
+		return fmt.Errorf("record %d: field %q timezone offset %s is outside the allowed range -23:59..+23:59",
+			position, e.field, formatZoneOffset(e.value))
+	case e.field == "collected_at" && e.issue == issueOffsetSeconds:
+		return fmt.Errorf("record %d: field %q timezone offset %s carries seconds; offsets must be whole minutes",
+			position, e.field, formatZoneOffset(e.value))
 	case e.field == "collected_at":
 		return fmt.Errorf("record %d: field %q is missing or invalid", position, e.field)
 	default:
@@ -399,6 +509,9 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 	t, err := time.Parse(time.RFC3339, collectedStr)
 	if err != nil {
 		return Heartbeat{}, fmt.Errorf("collected_at must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00+08:00): %w", err)
+	}
+	if err := checkCollectedAtText(collectedStr); err != nil {
+		return Heartbeat{}, err
 	}
 	h.CollectedAt = t
 

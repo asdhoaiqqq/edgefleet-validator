@@ -109,6 +109,8 @@ func heartbeatUsage() {
 	fmt.Println("    node          string   node id (non-empty, any length)")
 	fmt.Println("    seq           integer  sequence number (> 0)")
 	fmt.Println("    collected_at  string   RFC3339 with timezone, e.g. 2026-10-01T12:00:00+08:00")
+	fmt.Println("                           year 0000..9999; numeric offset hours 00..23 and")
+	fmt.Println("                           minutes 00..59, whole minutes only (no +24:00 or +00:60)")
 	fmt.Println("                           must not be later than the receive time")
 	fmt.Println("    version       string   version (non-empty, valid Unicode text)")
 	fmt.Println("    height        integer  block height (>= 0)")
