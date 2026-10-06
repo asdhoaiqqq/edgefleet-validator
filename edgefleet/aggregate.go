@@ -297,6 +297,9 @@ func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, part
 		partitions:    partitions,
 		partWatermark: make(map[int64]*int64),
 		idle:          make(map[int64]bool),
+		// Every partition starts out active and unreported; in legacy mode
+		// (partitions == 0) the counter stays zero and is never consulted.
+		unreportedActive: partitions,
 	}
 
 	// Read records with a line collector that keeps a read failure distinct
@@ -462,6 +465,14 @@ type aggregateState struct {
 	watermark     *int64
 	partWatermark map[int64]*int64 // partition -> last watermark; partitioned mode only
 	idle          map[int64]bool   // partitions declared idle in the input; partitioned mode only
+	// unreportedActive counts the partitions that are neither idle nor have
+	// reported a watermark yet; partitioned mode only. While it is positive
+	// no effective watermark exists, so the waiting check is a single look at
+	// this counter instead of a rescan of every partition's reporting state.
+	// It never increases: a partition leaves the count by reporting or by
+	// being declared idle, and resuming from idle always happens through a
+	// watermark record, which reports at the same moment.
+	unreportedActive int64
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
@@ -740,6 +751,15 @@ func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo
 		} else if prev, ok := s.partWatermark[p]; ok && next < *prev {
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
 		}
+		if _, reported := s.partWatermark[p]; !reported && !resuming {
+			// First report from an active partition: one fewer partition the
+			// effective watermark still waits for. A resume reports too, but
+			// a never-reported partition was already subtracted when it was
+			// declared idle, so the count needs no change on this path. A
+			// rejected (backwards) watermark returns above and never reaches
+			// this decrement.
+			s.unreportedActive--
+		}
 		s.partWatermark[p] = &next
 	}
 
@@ -763,6 +783,11 @@ func (s *aggregateState) processIdle(obj map[string]json.RawMessage, lineNo int)
 		return nil
 	}
 	s.idle[p] = true
+	if _, reported := s.partWatermark[p]; !reported {
+		// An unreported partition that goes idle stops being waited on: one
+		// fewer active partition the effective watermark still needs.
+		s.unreportedActive--
+	}
 	// With the partition excluded, the remaining non-idle partitions
 	// determine the effective watermark; the declaration itself can advance
 	// it and close windows, exactly like a watermark update.
@@ -794,10 +819,16 @@ func (s *aggregateState) advanceWatermark(lineNo int) error {
 // effectiveWatermark returns the minimum watermark over the non-idle
 // partitions once each of them has reported at least once, or nil
 // otherwise. When every partition is idle, nil is returned so the caller
-// keeps the last produced effective watermark.
+// keeps the last produced effective watermark. The waiting check itself is
+// the unreportedActive counter, maintained incrementally as partitions
+// report or go idle, so a watermark or idle record that arrives while
+// partitions are still silent costs one comparison rather than a rescan of
+// every partition's reporting state; only once the counter reaches zero --
+// every active partition has reported -- is the minimum computed by the
+// scan below, exactly as before.
 func (s *aggregateState) effectiveWatermark() *int64 {
 	active := s.partitions - int64(len(s.idle))
-	if active <= 0 {
+	if active <= 0 || s.unreportedActive > 0 {
 		return nil
 	}
 	var min int64
