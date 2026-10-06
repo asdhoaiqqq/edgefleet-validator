@@ -555,75 +555,151 @@ func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
 	return -1
 }
 
-func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
+// eventRecord is one input event whose record content has already been
+// interpreted and validated independently of aggregate state: key, time,
+// value and (in partitioned mode) partition are final. Nothing about idle
+// partitions, watermarks or windows has been inspected yet, so producing one
+// never mutates -- or even reads -- window state.
+type eventRecord struct {
+	key       string
+	time      int64
+	value     int64
+	partition int64 // partitioned mode only; always 0 in legacy mode
+}
+
+// parseEventRecord is the interpretation half of event intake. It reads and
+// checks the record's own fields and never consults aggregate state, so field
+// legality is fully decided before any idle, late or window rule runs. Fields
+// are validated in the order they have always been rejected: key, then time,
+// then value, then partition. The key is decoded strictly: an empty key,
+// invalid UTF-8 bytes and an unpaired or mispaired surrogate half are record
+// errors, never content repaired to U+FFFD that could merge keys. In legacy
+// mode (partitioned == false) extra fields -- including any stray partition
+// field -- stay ignored and partition is reported as zero.
+func parseEventRecord(obj map[string]json.RawMessage, partitioned bool, partitionCount int64, lineNo int) (eventRecord, error) {
 	key, err := requiredKey(obj, lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
 	if key == "" {
-		return &InputError{Line: lineNo, Reason: `field "key" must be a non-empty string`}
+		return eventRecord{}, &InputError{Line: lineNo, Reason: `field "key" must be a non-empty string`}
 	}
 	eventTime, err := requiredNonNegInt64(obj, "time", lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
 	value, err := requiredInt64(obj, "value", lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
-	p, err := s.requiredPartition(obj, lineNo)
+	var partition int64
+	if partitioned {
+		partition, err = requiredPartitionField(obj, partitionCount, lineNo)
+		if err != nil {
+			return eventRecord{}, err
+		}
+	}
+	return eventRecord{
+		key:       key,
+		time:      eventTime,
+		value:     value,
+		partition: partition,
+	}, nil
+}
+
+func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
+	// Stage 1: interpret and validate the record's own content without
+	// touching aggregate state.
+	ev, err := parseEventRecord(obj, s.partitions > 0, s.partitions, lineNo)
 	if err != nil {
 		return err
 	}
-	if s.partitions > 0 && s.idle[p] {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event for idle partition %d is not allowed; send a watermark to resume it first", p)}
+	// Stage 2: apply the validated event to aggregate state.
+	return s.acceptEvent(ev, lineNo)
+}
+
+// acceptEvent is the state half of event intake: it applies one record that
+// parseEventRecord has already fully validated, in the same order as before
+// the split -- idle partition first, then the global-watermark late rule, and
+// only afterwards the window counts. It never re-reads or re-validates record
+// fields, so a field problem can never be downgraded to an idle failure or a
+// late notice here. Partitioned mode judges lateness against the overall
+// effective watermark; an event on an idle partition stays fatal and never
+// resumes the partition implicitly. A strictly late event is skipped with the
+// existing notice; an event time equal to the watermark still enters its
+// windows.
+func (s *aggregateState) acceptEvent(ev eventRecord, lineNo int) error {
+	if s.partitions > 0 && s.idle[ev.partition] {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event for idle partition %d is not allowed; send a watermark to resume it first", ev.partition)}
 	}
 
-	if s.watermark != nil && eventTime < *s.watermark {
-		notice := fmt.Sprintf("line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *s.watermark)
+	if s.watermark != nil && ev.time < *s.watermark {
+		notice := fmt.Sprintf("line %d: late event time=%d below current watermark %d, skipped\n", lineNo, ev.time, *s.watermark)
 		if err := writeFull(s.lateLog, []byte(notice)); err != nil {
 			return &OutputError{
 				Line:   lineNo,
 				Kind:   "late-event notice",
-				Detail: fmt.Sprintf("event time %d below current watermark %d", eventTime, *s.watermark),
+				Detail: fmt.Sprintf("event time %d below current watermark %d", ev.time, *s.watermark),
 				Err:    err,
 			}
 		}
 		return nil
 	}
 
-	n := s.containingWindowCount(eventTime)
+	return s.applyEventToWindows(ev, lineNo)
+}
+
+// applyEventToWindows counts one accepted event in every window that contains
+// its event time, one count and the full value per window. It only mutates
+// window state; the caller has already settled field validity, idleness and
+// lateness. The window-end overflow precheck runs before any window is
+// touched; per-window count and sum overflows then fail on this triggering
+// event in ascending window-start order rather than at watermark closure.
+func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
+	n := s.containingWindowCount(ev.time)
 
 	// A window whose end leaves the signed 64-bit range is fatal for the
 	// whole input line; check before updating any window state.
-	if badStart := s.firstOverflowingStart(eventTime); badStart >= 0 {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, badStart, s.windowMillis)}
+	if badStart := s.firstOverflowingStart(ev.time); badStart >= 0 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, badStart, s.windowMillis)}
 	}
 
 	// Add the event once to each containing window, in ascending start
 	// order. An overflow here stops processing immediately; already closed
 	// (and thus already written) windows are unaffected.
 	for i := n - 1; i >= 0; i-- {
-		start := s.containingStart(eventTime, i)
-		end := start + s.windowMillis
-		id := windowID{start: start, key: key}
-		st := s.windows[id]
-		if st == nil {
-			st = &windowState{end: end}
-			s.windows[id] = st
+		start := s.containingStart(ev.time, i)
+		if err := s.addEventToWindow(ev, start, lineNo); err != nil {
+			return err
 		}
-		if st.count == math.MaxInt64 {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", key, start, end)}
-		}
-		if value > 0 && st.sum > math.MaxInt64-value {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
-		}
-		if value < 0 && st.sum < math.MinInt64-value {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
-		}
-		st.count++
-		st.sum += value
 	}
+	return nil
+}
+
+// addEventToWindow folds a single accepted event into one containing window,
+// creating the window first if needed, enforcing the signed 64-bit count and
+// cumulative-sum boundaries before the mutation. On failure the window keeps
+// its previous count and sum and the error names the physical line, the key
+// and this window's [start,end) interval.
+func (s *aggregateState) addEventToWindow(ev eventRecord, start int64, lineNo int) error {
+	end := start + s.windowMillis
+	id := windowID{start: start, key: ev.key}
+	st := s.windows[id]
+	if st == nil {
+		st = &windowState{end: end}
+		s.windows[id] = st
+	}
+	if st.count == math.MaxInt64 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", ev.key, start, end)}
+	}
+	if ev.value > 0 && st.sum > math.MaxInt64-ev.value {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", ev.key, start, end, st.sum, ev.value)}
+	}
+	if ev.value < 0 && st.sum < math.MinInt64-ev.value {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", ev.key, start, end, st.sum, ev.value)}
+	}
+	st.count++
+	st.sum += ev.value
 	return nil
 }
 
@@ -737,17 +813,28 @@ func (s *aggregateState) effectiveWatermark() *int64 {
 }
 
 // requiredPartition returns the record's partition index. In legacy mode it
-// returns 0 without inspecting the record, so extra fields stay ignored.
+// returns 0 without inspecting the record, so extra fields stay ignored. In
+// partitioned mode the actual reading and range checking lives in the shared
+// free function used by event interpretation as well.
 func (s *aggregateState) requiredPartition(obj map[string]json.RawMessage, lineNo int) (int64, error) {
 	if s.partitions == 0 {
 		return 0, nil
 	}
+	return requiredPartitionField(obj, s.partitions, lineNo)
+}
+
+// requiredPartitionField reads and range-checks a partitioned-mode record's
+// "partition" field. It is pure record interpretation: the partition count is
+// passed in rather than read from aggregate state, so both the event intake
+// split (parseEventRecord) and the watermark/idle paths validate the field by
+// the exact same rule without touching window state.
+func requiredPartitionField(obj map[string]json.RawMessage, partitionCount int64, lineNo int) (int64, error) {
 	p, err := requiredInt64(obj, "partition", lineNo)
 	if err != nil {
 		return 0, err
 	}
-	if p < 0 || p >= s.partitions {
-		return 0, &InputError{Line: lineNo, Reason: fmt.Sprintf("field %q must be an integer in range [0,%d), got %d", "partition", s.partitions, p)}
+	if p < 0 || p >= partitionCount {
+		return 0, &InputError{Line: lineNo, Reason: fmt.Sprintf("field %q must be an integer in range [0,%d), got %d", "partition", partitionCount, p)}
 	}
 	return p, nil
 }
