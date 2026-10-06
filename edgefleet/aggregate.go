@@ -506,53 +506,58 @@ func floorDiv(a, b int64) int64 {
 	return q
 }
 
-// containingWindowBounds returns the first and last (inclusive) window index
-// whose window [k*slideMillis, k*slideMillis+windowMillis) contains
-// eventTime. Windows start at 0, slideMillis, 2*slideMillis, ... and none
-// with a negative start is created, so the first index is clamped to zero.
-// The last index is eventTime/slideMillis, so an event at a window end is
-// outside that window.
-func (s *aggregateState) containingWindowBounds(eventTime int64) (first, last int64) {
-	last = eventTime / s.slideMillis
-	first = floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
+// containingWindows describes every window that contains one event time, in
+// one derivation shared by the normal counting path and the window-end
+// overflow precheck: how many windows there are, where each starts, and which
+// (if any) is the earliest whose end leaves the signed 64-bit range. Windows
+// start at 0, slide, 2*slide, ... and none with a negative start is created,
+// so the first index is clamped to zero. The last index is
+// eventTime/slide, so an event at a window end is outside that window.
+type containingWindows struct {
+	count     int64 // how many windows contain the event time
+	lastStart int64 // start of the last (highest) containing window
+	slide     int64 // distance between consecutive window starts
+	// firstOverflow is the start of the earliest containing window whose end
+	// (start + windowMillis) leaves the signed 64-bit range, or -1 when every
+	// containing window fits. Containing starts are an ascending arithmetic
+	// sequence with step slide, so overflow (if any) is a suffix and this is
+	// its first member.
+	firstOverflow int64
+}
+
+// containingWindows derives the containing-window range for eventTime.
+func (s *aggregateState) containingWindows(eventTime int64) containingWindows {
+	last := eventTime / s.slideMillis
+	first := floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
 	if first < 0 {
 		first = 0
 	}
-	return first, last
-}
-
-// containingWindowCount returns how many windows contain eventTime.
-func (s *aggregateState) containingWindowCount(eventTime int64) int64 {
-	first, last := s.containingWindowBounds(eventTime)
-	return last - first + 1
-}
-
-// containingStart returns the start of the containing window reached back by
-// offset indices from the last one (offset 0 = last window).
-func (s *aggregateState) containingStart(eventTime, offset int64) int64 {
-	last := eventTime - eventTime%s.slideMillis
-	return last - offset*s.slideMillis
-}
-
-// firstOverflowingStart reports the start of the earliest containing window
-// whose end (start + windowMillis) leaves the signed 64-bit range, or -1 when
-// every containing window fits. Containing starts are an ascending arithmetic
-// sequence with step slideMillis, so overflow (if any) is a suffix; this
-// computes its first member directly instead of walking the sequence.
-func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
-	n := s.containingWindowCount(eventTime)
-	lowest := s.containingStart(eventTime, n-1) // earliest containing start; never negative
+	w := containingWindows{
+		count:         last - first + 1,
+		lastStart:     eventTime - eventTime%s.slideMillis,
+		slide:         s.slideMillis,
+		firstOverflow: -1,
+	}
+	lowest := w.start(w.count - 1) // earliest containing start; never negative
 	maxSafeStart := int64(math.MaxInt64 - s.windowMillis)
-	if lowest > maxSafeStart {
-		return lowest
+	switch {
+	case lowest > maxSafeStart:
+		w.firstOverflow = lowest
+	default:
+		safe := (maxSafeStart-lowest)/s.slideMillis + 1 // containing starts that fit
+		if safe < w.count {
+			// Reach back from lastStart, which is at most eventTime, so the
+			// subtraction cannot leave the signed 64-bit range.
+			w.firstOverflow = w.start(w.count - 1 - safe)
+		}
 	}
-	safe := (maxSafeStart-lowest)/s.slideMillis + 1 // number of containing starts that fit
-	if safe < n {
-		// Reach back from last, which is at most eventTime, so the
-		// subtraction cannot leave the signed 64-bit range.
-		return s.containingStart(eventTime, n-1-safe)
-	}
-	return -1
+	return w
+}
+
+// start returns the start of the containing window reached back by offset
+// indices from the last one (offset 0 = last window).
+func (w containingWindows) start(offset int64) int64 {
+	return w.lastStart - offset*w.slide
 }
 
 // eventRecord is one input event whose record content has already been
@@ -652,24 +657,25 @@ func (s *aggregateState) acceptEvent(ev eventRecord, lineNo int) error {
 // applyEventToWindows counts one accepted event in every window that contains
 // its event time, one count and the full value per window. It only mutates
 // window state; the caller has already settled field validity, idleness and
-// lateness. The window-end overflow precheck runs before any window is
-// touched; per-window count and sum overflows then fail on this triggering
-// event in ascending window-start order rather than at watermark closure.
+// lateness. The containing-window range is derived once and shared by the
+// window-end overflow precheck and the counting loop, so both judge the exact
+// same set of windows. The precheck runs before any window is touched;
+// per-window count and sum overflows then fail on this triggering event in
+// ascending window-start order rather than at watermark closure.
 func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
-	n := s.containingWindowCount(ev.time)
+	wins := s.containingWindows(ev.time)
 
 	// A window whose end leaves the signed 64-bit range is fatal for the
 	// whole input line; check before updating any window state.
-	if badStart := s.firstOverflowingStart(ev.time); badStart >= 0 {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, badStart, s.windowMillis)}
+	if wins.firstOverflow >= 0 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, wins.firstOverflow, s.windowMillis)}
 	}
 
 	// Add the event once to each containing window, in ascending start
 	// order. An overflow here stops processing immediately; already closed
 	// (and thus already written) windows are unaffected.
-	for i := n - 1; i >= 0; i-- {
-		start := s.containingStart(ev.time, i)
-		if err := s.addEventToWindow(ev, start, lineNo); err != nil {
+	for i := wins.count - 1; i >= 0; i-- {
+		if err := s.addEventToWindow(ev, wins.start(i), lineNo); err != nil {
 			return err
 		}
 	}
