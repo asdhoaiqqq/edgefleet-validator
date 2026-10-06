@@ -506,51 +506,52 @@ func floorDiv(a, b int64) int64 {
 	return q
 }
 
-// containingWindowBounds returns the first and last (inclusive) window index
-// whose window [k*slideMillis, k*slideMillis+windowMillis) contains
-// eventTime. Windows start at 0, slideMillis, 2*slideMillis, ... and none
-// with a negative start is created, so the first index is clamped to zero.
-// The last index is eventTime/slideMillis, so an event at a window end is
-// outside that window.
-func (s *aggregateState) containingWindowBounds(eventTime int64) (first, last int64) {
-	last = eventTime / s.slideMillis
-	first = floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
+// windowRange is the full set of windows containing one event time: every
+// start from firstStart to lastStart inclusive, stepping by slideMillis.
+// Deriving it once keeps the normal counting loop and the window-end
+// overflow precheck reading the same window count, endpoints and positions.
+type windowRange struct {
+	firstStart int64 // earliest containing window start; never negative
+	lastStart  int64 // latest containing window start
+	count      int64 // number of containing windows; always >= 1
+}
+
+// containingWindows derives the range of windows
+// [k*slideMillis, k*slideMillis+windowMillis) containing eventTime. Windows
+// start at 0, slideMillis, 2*slideMillis, ... and none with a negative start
+// is created, so the first index is clamped to zero. The last index is
+// eventTime/slideMillis, so an event at a window end is outside that window.
+// windowMillis >= slideMillis guarantees count >= 1, and firstStart <=
+// lastStart <= eventTime keeps every derived start inside the signed 64-bit
+// range.
+func (s *aggregateState) containingWindows(eventTime int64) windowRange {
+	last := eventTime / s.slideMillis
+	first := floorDiv(eventTime-s.windowMillis, s.slideMillis) + 1
 	if first < 0 {
 		first = 0
 	}
-	return first, last
-}
-
-// containingWindowCount returns how many windows contain eventTime.
-func (s *aggregateState) containingWindowCount(eventTime int64) int64 {
-	first, last := s.containingWindowBounds(eventTime)
-	return last - first + 1
-}
-
-// containingStart returns the start of the containing window reached back by
-// offset indices from the last one (offset 0 = last window).
-func (s *aggregateState) containingStart(eventTime, offset int64) int64 {
-	last := eventTime - eventTime%s.slideMillis
-	return last - offset*s.slideMillis
-}
-
-// firstOverflowingStart reports the start of the earliest containing window
-// whose end (start + windowMillis) leaves the signed 64-bit range, or -1 when
-// every containing window fits. Containing starts are an ascending arithmetic
-// sequence with step slideMillis, so overflow (if any) is a suffix; this
-// computes its first member directly instead of walking the sequence.
-func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
-	n := s.containingWindowCount(eventTime)
-	lowest := s.containingStart(eventTime, n-1) // earliest containing start; never negative
-	maxSafeStart := int64(math.MaxInt64 - s.windowMillis)
-	if lowest > maxSafeStart {
-		return lowest
+	return windowRange{
+		firstStart: first * s.slideMillis,
+		lastStart:  last * s.slideMillis,
+		count:      last - first + 1,
 	}
-	safe := (maxSafeStart-lowest)/s.slideMillis + 1 // number of containing starts that fit
-	if safe < n {
-		// Reach back from last, which is at most eventTime, so the
-		// subtraction cannot leave the signed 64-bit range.
-		return s.containingStart(eventTime, n-1-safe)
+}
+
+// firstOverflowingStart reports the start of the earliest window in r whose
+// end (start + windowMillis) leaves the signed 64-bit range, or -1 when every
+// window in r fits. The starts are an ascending arithmetic sequence with step
+// slideMillis, so overflow (if any) is a suffix; this computes its first
+// member directly instead of walking the sequence.
+func (s *aggregateState) firstOverflowingStart(r windowRange) int64 {
+	maxSafeStart := int64(math.MaxInt64 - s.windowMillis)
+	if r.firstStart > maxSafeStart {
+		return r.firstStart
+	}
+	safe := (maxSafeStart-r.firstStart)/s.slideMillis + 1 // number of starts that fit
+	if safe < r.count {
+		// safe*slideMillis <= maxSafeStart-firstStart+slideMillis, so the
+		// sum stays below math.MaxInt64 and inside the signed 64-bit range.
+		return r.firstStart + safe*s.slideMillis
 	}
 	return -1
 }
@@ -656,24 +657,25 @@ func (s *aggregateState) acceptEvent(ev eventRecord, lineNo int) error {
 // touched; per-window count and sum overflows then fail on this triggering
 // event in ascending window-start order rather than at watermark closure.
 func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
-	n := s.containingWindowCount(ev.time)
+	windows := s.containingWindows(ev.time)
 
 	// A window whose end leaves the signed 64-bit range is fatal for the
 	// whole input line; check before updating any window state.
-	if badStart := s.firstOverflowingStart(ev.time); badStart >= 0 {
+	if badStart := s.firstOverflowingStart(windows); badStart >= 0 {
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, badStart, s.windowMillis)}
 	}
 
 	// Add the event once to each containing window, in ascending start
 	// order. An overflow here stops processing immediately; already closed
 	// (and thus already written) windows are unaffected.
-	for i := n - 1; i >= 0; i-- {
-		start := s.containingStart(ev.time, i)
+	for start := windows.firstStart; ; start += s.slideMillis {
 		if err := s.addEventToWindow(ev, start, lineNo); err != nil {
 			return err
 		}
+		if start == windows.lastStart {
+			return nil
+		}
 	}
-	return nil
 }
 
 // addEventToWindow folds a single accepted event into one containing window,
