@@ -462,9 +462,13 @@ func mergeRecord(known []Heartbeat, r Heartbeat) (updated []Heartbeat, dup bool,
 // Submit persists a batch of heartbeats. The whole batch is validated and
 // checked for duplicates/conflicts against stored data (and within the batch)
 // before anything is written: a single invalid or conflicting record fails
-// the batch with no changes. Duplicates are counted, not written. A
-// successful return means the batch was durably persisted; a persistence
-// failure is reported and previously queryable data is left intact.
+// the batch with no changes. Duplicates are counted, not written: a node whose
+// inputs all match its already-saved history is checked but never re-saved,
+// so a verbatim replay succeeds even when that node's save location cannot
+// create or replace files, and its existing file is never rewritten. Only
+// nodes that genuinely gained records are persisted. A successful return
+// means every new record was durably persisted; a persistence failure is
+// reported and previously queryable data is left intact.
 func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, dupCount int, err error) {
 	if len(records) == 0 {
 		return 0, 0, fmt.Errorf("no heartbeat records provided")
@@ -496,7 +500,13 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 		merged[r.NodeID] = list
 	}
 
-	// Merge with stored data per node, collecting new file contents.
+	// Merge with stored data per node, collecting new file contents. Every
+	// node the batch touches is loaded and checked — corruption, ownership and
+	// conflicts are all rejected before anything is saved — but only a node
+	// that genuinely gained records is queued for a write. A node whose inputs
+	// all duplicate its saved history contributes only duplicate counts and
+	// keeps its existing file exactly as-is, so a replay never depends on the
+	// ability to create or replace that node's file.
 	type update struct {
 		loc     nodeLocation
 		records []Heartbeat
@@ -512,6 +522,7 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 		if nf != nil {
 			existing = nf.Records
 		}
+		changed := false
 		for _, r := range batch {
 			var dup bool
 			existing, dup, err = mergeRecord(existing, r)
@@ -522,7 +533,11 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 				dupCount++
 			} else {
 				newCount++
+				changed = true
 			}
+		}
+		if !changed {
+			continue
 		}
 		sort.Slice(existing, func(i, j int) bool { return existing[i].Seq < existing[j].Seq })
 		updates = append(updates, update{loc: loc, records: existing})
