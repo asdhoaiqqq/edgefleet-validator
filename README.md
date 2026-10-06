@@ -441,9 +441,175 @@ line 4: {"type":"watermark","time":1000}                          (无换行，�
 - 返回错误是 `line 3: invalid JSON record: invalid character 'o' in literal null (expecting 'u')`，可通过 `errors.As(err, *edgefleet.InputError)` 取到结构化的 `Line=3` 和 `Reason`；它**覆盖**了之后才获知的读取错误（此时 `errors.Is(err, errUpstream)` 为 `false`）。
 - 第 3 行之前没有任何窗口被关闭，所以 `out` 为空；`lateLog` 也为空。第 4 行尾部和读取故障都不会再被处理或上报。
 
-输出写出侧的失败规则与读取侧对称：窗口结果或迟到提示未能完整写出时，返回 `*edgefleet.OutputError`（可 `errors.Is` 到写出器自己的错误），触发它的物理行号、key 与窗口区间或迟到事件时间都会标明，已完整写出的内容保留。
+输出写出侧的失败规则与读取侧对称：窗口结果或迟到提示未能完整写出时，返回 `*edgefleet.OutputError`（可 `errors.Is` 到写出器自己的错误），触发它的物理行号、结果类别、key 与窗口区间或迟到事件时间都会标明，已写出的字节保留。特别注意：写出器**收下整条结果（JSON 加换行）之后仍返回自己的错误时，调用依然失败**——完整字节数不能抵消错误。完整规则、可运行示例与逐场景输出见下一节《示例：通过 Go 库接入输出流——窗口结果写出失败如何判定》。
 
-以上规则均为现有产品行为，`edgefleet aggregate` 命令的用法、输入格式以及"输入结束时不补发未关闭窗口"的规则保持不变；库入口只是让调用方能够直接提供自己的 `io.Reader` 并按错误身份区分结束原因。
+以上规则均为现有产品行为，`edgefleet aggregate` 命令的用法、输入格式以及"输入结束时不补发未关闭窗口"的规则保持不变；库入口只是让调用方能够直接提供自己的 `io.Reader`/`io.Writer`，并按错误身份区分读取结束原因与写出失败原因。
+
+## 示例：通过 Go 库接入输出流——窗口结果写出失败如何判定
+
+上一节解决"输入是怎么结束的"，这一节解决**结果有没有真正送出去**。库入口仍然是 `edgefleet.RunAggregate`（滑动、分区变体同理）：
+
+```go
+func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Writer) error
+```
+
+`out`、`lateLog` 都是普通 `io.Writer`：真实接入时它们可能是网络连接、管道或日志管线客户端，对端可能在收下部分甚至全部字节后仍然报错。示例代码位于 [`examples/aggregate-write/main.go`](examples/aggregate-write/main.go)，输入用内存里的 `strings.Reader`、输出用内存里的自写 `io.Writer`，不涉及文件、网络与当前时间，可离线直接运行：
+
+```bash
+go run ./examples/aggregate-write
+```
+
+### 一条结果怎样才算"写出了"
+
+每条输出都必须在**一次 `Write` 调用中完整落地**：窗口结果是"完整 JSON 对象 **加行尾换行**"（`{"key":...}\n`），迟到提示是完整一行。判定只有两条：
+
+| `Write(p)` 的返回 | 含义 | `RunAggregate` 返回 |
+| --- | --- | --- |
+| `n == len(p)` 且 `err == nil` | 完整写出 | 继续处理 |
+| `err != nil`（无论 `n` 是 0、部分还是 **`len(p)`**） | 写出端自己的故障 | `*edgefleet.OutputError`，其 `Err` 为写出器返回的**原始错误** |
+| `err == nil` 但 `n < len(p)` | 内容没写全 | `*edgefleet.OutputError`，其 `Err` 为 `io.ErrShortWrite` |
+
+两个容易踩空的点：
+
+- **收下整条 JSON 和换行、同时返回自己的错误，仍然是写出失败。** 完整字节数不能抵消错误——字节已经到了对端的缓冲区，不等于对端承认了这次投递；调用方必须按返回错误处理，不能因为"行看起来完整"就当成功。
+- **只收部分字节却返回 `nil`，报 `io.ErrShortWrite`。** 这是 `io.Writer` 契约里的短写：没有错误身份可以挂，库统一补上 `io.ErrShortWrite`，调用方用 `errors.Is(err, io.ErrShortWrite)` 识别。
+- 两种情况可以叠加区分：收了**部分**字节、又返回**自己的错误**时，保留的是那个原始错误（`errors.Is` 能到它），而不是 `io.ErrShortWrite`——短写哨兵只在写出器返回空错误时使用。
+
+失败统一包成 `*edgefleet.OutputError`，用 `errors.As` 取出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `Line` | 触发这批输出的**物理输入行号**（空行也占行号） |
+| `Kind` | 结果类别：`"window result"`（窗口结果）或 `"late-event notice"`（迟到提示） |
+| `Detail` | 窗口结果给出 `key "k" window [start,end)`；迟到提示给出迟到事件时间与判定所用水位线 |
+| `Err` | 写出端的错误：写出器自己的错误（原样保留），或 `io.ErrShortWrite`；`errors.Is` 经 `Unwrap` 生效 |
+
+错误字符串形如：
+
+```text
+line 6: window result not fully written (key "sensor-a" window [1000,2000)): result sink connection broken
+```
+
+### 失败之后：保留什么、不做什么
+
+一次写出失败立即终止本次运行，规则与读取失败对称：
+
+- 写出器**已经收下的字节原样保留**：此前完整写出（含换行）的结果行仍是有效窗口结果；失败那一次 `Write` 收下的字节——哪怕恰好是一整行——只是**物理残留，不是被承认的窗口结果**，调用方要靠 `*OutputError` 而不是靠"缓冲里有没有这行"来判定。
+- 引擎**不会重发或重试**失败内容（不会补写缺失尾部），**不会继续输出同一水位线本批剩余的窗口**，也**不再读取或处理后续任何记录**；输入结束（无论正常 EOF 还是读取故障）**不会补发**仍未关闭的窗口。
+- 迟到提示写出失败时规则相同，只是 `Kind` 为 `"late-event notice"`、`Detail` 标明迟到事件时间和水位线。
+
+### 同一份输入：一条水位线关闭三个窗口
+
+示例四个场景共用同一份逐行 JSON 输入（1000 毫秒固定窗口，单个 key `sensor-a`，共 **7 个物理行**；**第 3 行是空行**，空行被忽略但照占行号，所以触发写出的水位线在第 6 行；第 7 行无尾换行）：
+
+```text
+line 1: {"type":"event","key":"sensor-a","time":100,"value":1}    + "\n"
+line 2: {"type":"event","key":"sensor-a","time":150,"value":2}    + "\n"
+line 3: (blank line)                                              + "\n"
+line 4: {"type":"event","key":"sensor-a","time":1100,"value":3}   + "\n"
+line 5: {"type":"event","key":"sensor-a","time":2100,"value":4}   + "\n"
+line 6: {"type":"watermark","time":3000}                          + "\n"
+line 7: {"type":"event","key":"sensor-a","time":3100,"value":5}   (no newline)
+```
+
+窗口参数是 `RunAggregate(r, 1000, out, lateLog)`。第 1、2 行事件落在 `[0,1000)`（count=2、sum=3），第 4 行落在 `[1000,2000)`（count=1、sum=3），第 5 行落在 `[2000,3000)`（count=1、sum=4）。**第 6 行水位线 3000 在一次处理中按 end 升序连续关闭三个窗口**，每个窗口对应一次 `Write`：
+
+```text
+[0,1000)  ->  第 1 次 Write（成功后即被承认）
+[1000,2000)  ->  第 2 次 Write（示例在这一次制造失败）
+[2000,3000)  ->  第 3 次 Write（失败后不再发生）
+```
+
+第 7 行事件属于 `[3000,4000)`，之后再无水位线；即使在成功场景里，输入结束也不会补发它。示例的故障写出器只在**第 2 次 `Write`**（中间窗口 `[1000,2000)`）上按脚本行动，于是同一份输入就能对照"前面的结果成功写出、中间一条写出出问题、后面还有本可输出的窗口"。
+
+### 场景一（对照）：写出端正常，三个窗口全部输出
+
+`out` 是健康的缓冲写出器。返回错误为 `nil`，接收端恰好三行完整结果（每行都带换行），无残留片段，`lateLog` 为空：
+
+```text
+=== 1. control: a healthy bytes.Buffer writer ===
+result lines fully written by EARLIER, successful calls (valid window results):
+  {"key":"sensor-a","start":0,"end":1000,"count":2,"sum":3}
+  {"key":"sensor-a","start":1000,"end":2000,"count":1,"sum":3}
+  {"key":"sensor-a","start":2000,"end":3000,"count":1,"sum":4}
+bytes the failing call itself left behind: (none — no call failed)
+late-event notice stream (lateLog): (none)
+returned error: <nil>
+  err == nil -> run succeeded; every window the watermark closed was written
+```
+
+### 场景二：整条 JSON 与换行都已收下，写出器同时返回自己的错误
+
+第 2 次 `Write` 收下全部 61 个字节（`{"key":...,"sum":3}\n`，长度恰好等于提交长度）却返回 `result sink connection broken`。调用仍然失败：错误是 `*edgefleet.OutputError`，`Err` 为写出器原始错误，`errors.Is(err, errSinkBroken)` 为 `true`，而 `errors.Is(err, io.ErrShortWrite)` 为 `false`。接收端的字节分成两部分呈现——**此前成功调用写出的 `[0,1000)` 一行是有效结果；失败那一次留下的一整行物理上存在，但不被承认**，不能当成 `[1000,2000)` 的窗口结果处理：
+
+```text
+=== 2. failing call offers/keeps the whole line (JSON + newline) and returns its own error ===
+result lines fully written by EARLIER, successful calls (valid window results):
+  {"key":"sensor-a","start":0,"end":1000,"count":2,"sum":3}
+bytes the failing call itself left behind: "{\"key\":\"sensor-a\",\"start\":1000,\"end\":2000,\"count\":1,\"sum\":3}\n" (61 of 61 bytes offered) — the WHOLE result line including its newline is physically present, but the Write returned an error: it is retained yet NOT an acknowledged window result
+late-event notice stream (lateLog): (none)
+returned error: line 6: window result not fully written (key "sensor-a" window [1000,2000)): result sink connection broken
+  errors.As(*edgefleet.OutputError) -> true
+    triggering input line  : 6 (the blank physical line 3 kept its line number)
+    result category (Kind) : "window result"
+    record detail          : key "sensor-a" window [1000,2000)
+    writer error (Err)     : result sink connection broken
+  errors.Is(err, errSinkBroken)  -> true (the writer's own error exposed through Unwrap)
+  errors.Is(err, io.ErrShortWrite) -> false
+```
+
+### 场景三：只收下 12 个字节的前缀，却返回空错误
+
+第 2 次 `Write` 只保留前缀 `{"key":"sens`（61 字节中的 12 个）并返回 `nil`。这是短写：`Err` 为 `io.ErrShortWrite`，`errors.Is(err, io.ErrShortWrite)` 为 `true`。接收端在第一个完整行之后是一个**残留片段**，它不是合法 JSON、更不是窗口结果；同批第三个窗口 `[2000,3000)` 不会再写出：
+
+```text
+=== 3. failing call keeps only a 12-byte prefix and returns nil ===
+result lines fully written by EARLIER, successful calls (valid window results):
+  {"key":"sensor-a","start":0,"end":1000,"count":2,"sum":3}
+bytes the failing call itself left behind: "{\"key\":\"sens" (12 of 61 bytes offered) — a residual fragment, NOT a valid window result
+late-event notice stream (lateLog): (none)
+returned error: line 6: window result not fully written (key "sensor-a" window [1000,2000)): short write
+  errors.As(*edgefleet.OutputError) -> true
+    triggering input line  : 6 (the blank physical line 3 kept its line number)
+    result category (Kind) : "window result"
+    record detail          : key "sensor-a" window [1000,2000)
+    writer error (Err)     : short write
+  errors.Is(err, errSinkBroken)  -> false (the writer's own error exposed through Unwrap)
+  errors.Is(err, io.ErrShortWrite) -> true
+```
+
+### 场景四：收下部分前缀，同时返回自己的错误
+
+第 2 次 `Write` 同样只保留 12 字节前缀，但这次返回 `result sink connection broken`。保留的是**写出器的原始错误**而不是短写哨兵：`errors.Is(err, errSinkBroken)` 为 `true`、`errors.Is(err, io.ErrShortWrite)` 为 `false`。接收端内容与场景三相同（一个完整行加一个残留片段），区别只在错误身份——这正是调用方区分"对端明确报错"与"对端违约式短写"的依据：
+
+```text
+=== 4. failing call keeps only a 12-byte prefix and returns its own error ===
+result lines fully written by EARLIER, successful calls (valid window results):
+  {"key":"sensor-a","start":0,"end":1000,"count":2,"sum":3}
+bytes the failing call itself left behind: "{\"key\":\"sens" (12 of 61 bytes offered) — a residual fragment, NOT a valid window result
+late-event notice stream (lateLog): (none)
+returned error: line 6: window result not fully written (key "sensor-a" window [1000,2000)): result sink connection broken
+  errors.As(*edgefleet.OutputError) -> true
+    triggering input line  : 6 (the blank physical line 3 kept its line number)
+    result category (Kind) : "window result"
+    record detail          : key "sensor-a" window [1000,2000)
+    writer error (Err)     : result sink connection broken
+  errors.Is(err, errSinkBroken)  -> true (the writer's own error exposed through Unwrap)
+  errors.Is(err, io.ErrShortWrite) -> false
+```
+
+### 把接收内容对应回水位线
+
+三个失败场景的接收端可以直接对照第 6 行水位线本应关闭的三个窗口：
+
+| 窗口 | 触发它的水位线 | 三个失败场景里的结局 |
+| --- | --- | --- |
+| `[0,1000)` | 第 6 行（本批第 1 次写出，先于故障） | **完整保留**，是唯一被承认的窗口结果行 |
+| `[1000,2000)` | 第 6 行（本批第 2 次写出，即故障点） | 未被承认：场景二物理上留有一整行，场景三/四留有 12 字节片段；**均不是有效结果**，引擎不重发 |
+| `[2000,3000)` | 第 6 行（本批第 3 次写出） | **完全没有输出**：故障后同批剩余窗口不再写出 |
+| `[3000,4000)` | 本应由更晚的水位线关闭 | 第 7 行事件在故障后不再被读取；即使读到，输入结束也不补发未关闭窗口 |
+
+接入方据此即可判定一次调用：`err == nil` 且收到的完整行覆盖本批全部窗口才算成功；拿到 `*edgefleet.OutputError` 时，用 `Line`/`Kind`/`Detail` 定位是哪条输入触发的哪个窗口结果，用 `errors.Is` 在写出端原始错误与 `io.ErrShortWrite` 之间区分原因，再按"完整行保留、残留丢弃、后续窗口缺失"来处理下游一致性。窗口结果与迟到提示的写出规则、错误类型在四个库入口（`RunAggregate`、`RunAggregateSliding`、`RunAggregatePartitioned`、`RunAggregatePartitionedSliding`）上完全一致。
 
 ## 技术方向
 
