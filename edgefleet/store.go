@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // formatMarker identifies the on-disk file format version.
@@ -75,10 +76,47 @@ func OpenStore(dir string) (*Store, error) {
 // Dir returns the data directory path.
 func (s *Store) Dir() string { return s.dir }
 
-// nodePath maps a node id to its per-node file. Hex encoding keeps arbitrary
-// node ids safe as filenames while remaining reversible.
+// legacyNodeNameMax is the largest per-node file base name kept directly in
+// the nodes directory: hex(nodeID)+".json". It matches the local filesystem's
+// 255-byte file name limit, so every id whose encoded name is at most this long
+// — including every id that was ever savable before long-id support — keeps
+// its exact old file location, with no migration or rename.
+const legacyNodeNameMax = 255
+
+// nodeNameChunk is the hex segment size used when the full encoded file name
+// is longer than legacyNodeNameMax: the encoding is split left to right into
+// nested directory components of this many hex characters, and the final
+// segment carries the ".json" suffix. Every path component then stays well
+// under the file name limit (the longest is nodeNameChunk+5 bytes), while the
+// whole path still encodes the complete node id, in order — nothing is hashed,
+// truncated, trimmed, case-folded or replaced, so two ids sharing a long
+// prefix and differing only at the end remain distinct files.
+const nodeNameChunk = 128
+
+// nodePathFor maps a node id to its per-node file path. Hex encoding keeps
+// arbitrary node ids safe as file names while remaining reversible. Short
+// ids live at <nodesDir>/<hex>.json exactly as before; ids whose encoded name
+// would exceed the file name limit are stored in nested hex directories:
+//
+//	<nodesDir>/<hex[0:128]>/<hex[128:256]>/.../<hex-tail>.json
+func nodePathFor(nodesDir, nodeID string) string {
+	encoded := hex.EncodeToString([]byte(nodeID))
+	name := encoded + ".json"
+	if len(name) <= legacyNodeNameMax {
+		return filepath.Join(nodesDir, name)
+	}
+	parts := make([]string, 0, len(encoded)/nodeNameChunk+2)
+	for len(encoded) > nodeNameChunk {
+		parts = append(parts, encoded[:nodeNameChunk])
+		encoded = encoded[nodeNameChunk:]
+	}
+	parts = append(parts, encoded+".json")
+	return filepath.Join(append([]string{nodesDir}, parts...)...)
+}
+
+// nodePath maps a node id to its per-node file.
 func (s *Store) nodePath(nodeID string) string {
-	return filepath.Join(s.nodesDir, hex.EncodeToString([]byte(nodeID))+".json")
+	return nodePathFor(s.nodesDir, nodeID)
 }
 
 // lock acquires the directory lock. Exclusive for writes, shared for reads.
@@ -110,21 +148,93 @@ func checksumRecords(records []Heartbeat) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// nodeIDFromPath recovers the node id a store file belongs to from its file
-// name: nodePath writes each node's records to hex(nodeID)+".json", so the
-// owner is exactly the string the base name decodes to. Node ids are compared
-// as the exact strings they are — ids containing Chinese characters, spaces
-// or slashes decode back unchanged and are never normalised or merged.
+// isHex reports whether s contains hexadecimal digits only (an empty string
+// counts as hex; callers additionally require a non-empty owner).
+func isHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeIDFromPath recovers the node id a store file belongs to from its
+// location. nodePathFor writes exactly two shapes, and both are enforced
+// here:
+//
+//   - flat:   <parent>/hex(nodeID).json          when the name is at most
+//     legacyNodeNameMax bytes;
+//   - sharded: <parent>/<128 hex>/.../<tail>.json, every directory component
+//     exactly nodeNameChunk hex characters and the final tail 1..128
+//     hex characters, used only when the flat name would exceed the
+//     file name limit.
+//
+// The owner is the exact bytes those hex components decode to, in order —
+// nothing is hashed, truncated or normalised, so ids with Chinese characters,
+// emoji or spaces decode back unchanged. A location that mixes the shapes
+// (a shard directory for an id short enough to be flat, an overlong flat
+// name, a mis-sized shard component or a tail that canonical writing would
+// split again) is rejected: such a path can never be produced by nodePathFor,
+// and the per-record ownership check below independently guarantees a foreign
+// node's file can never be read as this node's telemetry.
 func nodeIDFromPath(path string) (string, error) {
+	path = filepath.Clean(path)
 	base := filepath.Base(path)
 	if !strings.HasSuffix(base, ".json") {
 		return "", fmt.Errorf("file name %q is not a per-node heartbeat file", base)
 	}
-	raw, err := hex.DecodeString(strings.TrimSuffix(base, ".json"))
+	tail := strings.TrimSuffix(base, ".json")
+	if len(tail) == 0 || !isHex(tail) {
+		return "", fmt.Errorf("file name %q does not encode a node id", base)
+	}
+
+	// Gather the fixed-size hex directory components, innermost first.
+	var chunks []string
+	dir := filepath.Dir(path)
+	for {
+		part := filepath.Base(dir)
+		if len(part) != nodeNameChunk || !isHex(part) {
+			break
+		}
+		chunks = append(chunks, part)
+		dir = filepath.Dir(dir)
+	}
+
+	encoded := tail
+	for _, chunk := range chunks {
+		// chunks were gathered innermost first; prepend each in that order.
+		encoded = chunk + encoded
+	}
+
+	// Shape consistency with nodePathFor:
+	//  - without shard directories the whole encoding is the file name and
+	//    must fit the local file name limit;
+	//  - with shard directories the tail is at most one chunk and the full
+	//    encoding must actually be too long for a flat file name.
+	fullNameLen := len(encoded) + len(".json")
+	switch {
+	case len(chunks) == 0 && fullNameLen > legacyNodeNameMax:
+		return "", fmt.Errorf("file name %q exceeds the %d-byte per-node file name limit and is not sharded", base, legacyNodeNameMax)
+	case len(chunks) > 0 && len(tail) > nodeNameChunk:
+		return "", fmt.Errorf("file %q has an overlong shard tail %q", path, tail)
+	case len(chunks) > 0 && fullNameLen <= legacyNodeNameMax:
+		return "", fmt.Errorf("file %q uses shard directories for a node id short enough for a flat file name", path)
+	}
+
+	raw, err := hex.DecodeString(encoded)
 	if err != nil {
 		return "", fmt.Errorf("file name %q does not encode a node id: %w", base, err)
 	}
-	return string(raw), nil
+	owner := string(raw)
+	if owner == "" {
+		return "", fmt.Errorf("file name %q encodes an empty node id", base)
+	}
+	if !utf8.ValidString(owner) {
+		return "", fmt.Errorf("file name %q does not encode valid Unicode node text", base)
+	}
+	return owner, nil
 }
 
 // loadNodeFile reads and verifies the file for one node. A missing file means
@@ -132,12 +242,12 @@ func nodeIDFromPath(path string) (string, error) {
 // or structural failure is reported as a CorruptError.
 //
 // Ownership: the file belongs to exactly one node — the one encoded in its
-// file name — and every record in it must declare that same node id. A file
-// whose records name another node (for example another node's file copied
-// over this one, format and checksum still intact) is not that node's
-// telemetry: the whole file is refused as corrupt, no matter where the
-// foreign record sits in the history and even if the latest record happens
-// to name the right node.
+// storage location (flat hex file name or nested hex shard directories) — and
+// every record in it must declare that same node id. A file whose records name
+// another node (for example another node's file copied over this one, format
+// and checksum still intact) is not that node's telemetry: the whole file is
+// refused as corrupt, no matter where the foreign record sits in the history
+// and even if the latest record happens to name the right node.
 //
 // The file is decoded with the same strict rules as submit input: every
 // telemetry field must be present, non-null and written once per record. A
@@ -150,6 +260,16 @@ func loadNodeFile(path string) (*nodeFile, error) {
 		return nil, nil
 	}
 	if err != nil {
+		// Every component of a store path fits the per-component file name
+		// limit (see nodePathFor); a residual ENAMETOOLONG can therefore only
+		// mean the complete path is longer than the operating system's whole
+		// path limit (e.g. PATH_MAX). Such a file cannot have been created by
+		// this store at all, so it is absent for every practical purpose —
+		// not corrupt — and a query reads it as no telemetry rather than as a
+		// data-integrity failure.
+		if errors.Is(err, syscall.ENAMETOOLONG) {
+			return nil, nil
+		}
 		return nil, &CorruptError{Path: path, Err: err}
 	}
 	nf, err := decodeStrictNodeFile(data)
@@ -318,6 +438,11 @@ func writeNodeFile(path string, records []Heartbeat) error {
 
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	// Long node ids live in nested hex directories; create the shard path on
+	// first save. nodesDir itself was created by OpenStore.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
