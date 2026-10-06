@@ -462,7 +462,9 @@ func mergeRecord(known []Heartbeat, r Heartbeat) (updated []Heartbeat, dup bool,
 // Submit persists a batch of heartbeats. The whole batch is validated and
 // checked for duplicates/conflicts against stored data (and within the batch)
 // before anything is written: a single invalid or conflicting record fails
-// the batch with no changes. Duplicates are counted, not written. A
+// the batch with no changes. Duplicates are counted, not written, and a node
+// whose records are all duplicates of its saved history is not re-saved at
+// all — only nodes that actually gained records are persisted. A
 // successful return means the batch was durably persisted; a persistence
 // failure is reported and previously queryable data is left intact.
 func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, dupCount int, err error) {
@@ -496,7 +498,13 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 		merged[r.NodeID] = list
 	}
 
-	// Merge with stored data per node, collecting new file contents.
+	// Merge with stored data per node, collecting new file contents. Every
+	// node's stored history is still loaded and checked (corruption or a
+	// conflict rejects the whole batch before anything is written), but a
+	// node whose records are all duplicates of what is already saved gains
+	// no record, so its file is left untouched: re-saving identical content
+	// would only turn a harmless retransmit into a write failure when the
+	// file's directory cannot be created or replaced.
 	type update struct {
 		loc     nodeLocation
 		records []Heartbeat
@@ -512,6 +520,7 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 		if nf != nil {
 			existing = nf.Records
 		}
+		nodeNew := 0
 		for _, r := range batch {
 			var dup bool
 			existing, dup, err = mergeRecord(existing, r)
@@ -522,7 +531,11 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 				dupCount++
 			} else {
 				newCount++
+				nodeNew++
 			}
+		}
+		if nodeNew == 0 {
+			continue
 		}
 		sort.Slice(existing, func(i, j int) bool { return existing[i].Seq < existing[j].Seq })
 		updates = append(updates, update{loc: loc, records: existing})
