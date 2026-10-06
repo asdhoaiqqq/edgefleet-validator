@@ -555,74 +555,141 @@ func (s *aggregateState) firstOverflowingStart(eventTime int64) int64 {
 	return -1
 }
 
-func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
+// eventRecord is one event whose content has been fully interpreted: every
+// field was read and checked in its required order, the key decoded
+// strictly, and the partition resolved for the active mode. It carries
+// record content only and knows nothing of watermarks, partition idleness
+// or window state, so producing one never reads or changes aggregation
+// state. The stateful decisions about such a record live in receiveEvent.
+type eventRecord struct {
+	key       string
+	eventTime int64
+	value     int64
+	partition int64 // 0 in legacy single-watermark mode, which ignores the field
+}
+
+// parseEventRecord interprets a raw event object: it reads and validates the
+// record content only -- the strictly decoded, non-empty key, then the
+// non-negative time, then the signed 64-bit value, then the partition field
+// in partitioned mode (legacy mode ignores it with every other extra
+// field). This is the fixed order in which content errors are reported, and
+// a damaged key (invalid UTF-8 or an unpaired/mispaired surrogate) fails
+// here as *InputError rather than being repaired to U+FFFD. The function
+// consults no watermark or partition/idle state and mutates nothing, so a
+// field problem can never be downgraded to a late-event notice or absorbed
+// into a window: nothing below this return is reached until the content is
+// known-good.
+func (s *aggregateState) parseEventRecord(obj map[string]json.RawMessage, lineNo int) (eventRecord, error) {
 	key, err := requiredKey(obj, lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
 	if key == "" {
-		return &InputError{Line: lineNo, Reason: `field "key" must be a non-empty string`}
+		return eventRecord{}, &InputError{Line: lineNo, Reason: `field "key" must be a non-empty string`}
 	}
 	eventTime, err := requiredNonNegInt64(obj, "time", lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
 	value, err := requiredInt64(obj, "value", lineNo)
 	if err != nil {
-		return err
+		return eventRecord{}, err
 	}
-	p, err := s.requiredPartition(obj, lineNo)
+	partition, err := s.requiredPartition(obj, lineNo)
+	if err != nil {
+		return eventRecord{}, err
+	}
+	return eventRecord{key: key, eventTime: eventTime, value: value, partition: partition}, nil
+}
+
+// processEvent handles one event record and keeps its two concerns apart:
+// parseEventRecord interprets and checks the record without state, and only
+// then does receiveEvent consult and change run state.
+func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
+	ev, err := s.parseEventRecord(obj, lineNo)
 	if err != nil {
 		return err
 	}
-	if s.partitions > 0 && s.idle[p] {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event for idle partition %d is not allowed; send a watermark to resume it first", p)}
+	return s.receiveEvent(ev, lineNo)
+}
+
+// receiveEvent applies the run's stateful admission rules to an already
+// valid event and, when it is admitted, counts it. It does no field
+// interpretation. The partition rule comes first: an event for a partition
+// declared idle is fatal and never resumes it implicitly. The lateness rule
+// comes next and uses the overall (effective, minimum) watermark: an event
+// strictly below it only gets the existing notice and is skipped, while one
+// equal to the watermark is still on time. A notice that cannot be written
+// in full is *OutputError wrapping the writer's own error; content already
+// written is left in place. Only an event passing both rules reaches
+// addEventToWindows, the single owner of window-state mutation.
+func (s *aggregateState) receiveEvent(ev eventRecord, lineNo int) error {
+	if s.partitions > 0 && s.idle[ev.partition] {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("event for idle partition %d is not allowed; send a watermark to resume it first", ev.partition)}
 	}
 
-	if s.watermark != nil && eventTime < *s.watermark {
-		notice := fmt.Sprintf("line %d: late event time=%d below current watermark %d, skipped\n", lineNo, eventTime, *s.watermark)
+	if s.watermark != nil && ev.eventTime < *s.watermark {
+		notice := fmt.Sprintf("line %d: late event time=%d below current watermark %d, skipped\n", lineNo, ev.eventTime, *s.watermark)
 		if err := writeFull(s.lateLog, []byte(notice)); err != nil {
 			return &OutputError{
 				Line:   lineNo,
 				Kind:   "late-event notice",
-				Detail: fmt.Sprintf("event time %d below current watermark %d", eventTime, *s.watermark),
+				Detail: fmt.Sprintf("event time %d below current watermark %d", ev.eventTime, *s.watermark),
 				Err:    err,
 			}
 		}
 		return nil
 	}
 
-	n := s.containingWindowCount(eventTime)
+	return s.addEventToWindows(ev, lineNo)
+}
+
+// addEventToWindows is the only place an admitted event changes window
+// state: the event is counted once in every window containing its event
+// time and its value is added in full to each. It is reached solely for
+// events that parsed and passed the idle and lateness rules, so record
+// interpretation never interleaves with these updates. Containing windows
+// start at time zero, are left-closed right-open, advance by slideMillis
+// (which need not divide the window length; equality is the fixed-window
+// case) and are visited in ascending start order. Every integer boundary is
+// enforced on the triggering physical line before the offending window is
+// changed -- first a window end outside the signed 64-bit range for any
+// containing window, then a count that would leave that range, then a
+// cumulative sum that would -- so the event never touches the overflowing
+// window or any later one, the error names the physical line, key and the
+// actual window, and already closed (written) windows are unaffected.
+func (s *aggregateState) addEventToWindows(ev eventRecord, lineNo int) error {
+	n := s.containingWindowCount(ev.eventTime)
 
 	// A window whose end leaves the signed 64-bit range is fatal for the
 	// whole input line; check before updating any window state.
-	if badStart := s.firstOverflowingStart(eventTime); badStart >= 0 {
-		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", key, badStart, s.windowMillis)}
+	if badStart := s.firstOverflowingStart(ev.eventTime); badStart >= 0 {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, badStart, s.windowMillis)}
 	}
 
 	// Add the event once to each containing window, in ascending start
 	// order. An overflow here stops processing immediately; already closed
 	// (and thus already written) windows are unaffected.
 	for i := n - 1; i >= 0; i-- {
-		start := s.containingStart(eventTime, i)
+		start := s.containingStart(ev.eventTime, i)
 		end := start + s.windowMillis
-		id := windowID{start: start, key: key}
+		id := windowID{start: start, key: ev.key}
 		st := s.windows[id]
 		if st == nil {
 			st = &windowState{end: end}
 			s.windows[id] = st
 		}
 		if st.count == math.MaxInt64 {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", key, start, end)}
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("event count overflow for key %q window [%d,%d)", ev.key, start, end)}
 		}
-		if value > 0 && st.sum > math.MaxInt64-value {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
+		if ev.value > 0 && st.sum > math.MaxInt64-ev.value {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", ev.key, start, end, st.sum, ev.value)}
 		}
-		if value < 0 && st.sum < math.MinInt64-value {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", key, start, end, st.sum, value)}
+		if ev.value < 0 && st.sum < math.MinInt64-ev.value {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("cumulative sum overflow for key %q window [%d,%d): %d + %d", ev.key, start, end, st.sum, ev.value)}
 		}
 		st.count++
-		st.sum += value
+		st.sum += ev.value
 	}
 	return nil
 }
