@@ -139,6 +139,186 @@ go run ./cmd/edgefleet heartbeat health --data-dir "$D" --node older \
 
 这与上一节的漏签基准相互独立：`--missed-since-seq` 只改变漏签告警的统计口径（第二行的 `new_missed`），选中的记录始终是序号最大的那一条，在线状态始终只看它的采集时间到 `--at` 的间隔，首行的 `missed` 也始终是它的累计漏签数。基准既不会换记录，也不会把离线改成在线。
 
+### 补传一批心跳：new/duplicate 计数、记录冲突与写入失败
+
+`heartbeat submit` 的输入是一个 JSON 数组，一批可以补传多条、跨多个节点。成功时只向 stdout 打印一行 `submitted: new=<新增> duplicate=<重复>`。要读懂这两个计数，先明确记录身份与重复/冲突的判定；判定只看记录内容和已落盘的历史，与接收时间无关，平台重启后结论不变。
+
+**记录身份由节点标识（`node`）与序号（`seq`）共同决定。** 序号不是全局编号：每个节点各自从 1 编号，不同节点使用相同序号互不冲突，分别写入各自的节点文件。
+
+**同一身份还要遥测内容全部一致才算重复。** 即版本（`version`）、区块高度（`height`）、累计漏签数（`missed`）和真实采集时刻（`collected_at`）全部相等。其中：
+
+- 采集时刻比的是时间轴上的同一瞬间：`2026-10-02T00:01:00Z` 与 `2026-10-02T08:01:00+08:00` 是同一时刻，算一致（小数秒也完整参与比较，见前文）。
+- 节点标识和版本按 JSON 解码后的原始文本比较：同一文本的不同 JSON 写法（例如用反斜杠 `u` 加四位十六进制的 Unicode 转义写出某个字符）解码后完全相同，就算同一节点或同一版本，不会产生第二个身份；而 `"1.0"` 与 `"1.0.0"` 解码后的文本不同，就是不同版本。健康结果里文本是否加引号只是展示规则，不影响这里的比较。
+
+**同一身份、任一遥测内容不同就是冲突（conflict），不是更新。** 后提交的内容绝不会覆盖或改写旧记录；冲突会让整批被拒绝（见下）。
+
+**计数按输入中的出现次数，而不是按去重后的条数：**
+
+- 已经保存过的记录在输入中出现几次，就计几次 duplicate；
+- 此前尚未保存的相同记录在一批中多次出现：只有第一次计一次 new，其余各次都计 duplicate，历史里只保存一条；
+- 因而恒有“提交条数 = new + duplicate”，而历史真正增加的条数只等于 new——重复的记录不会再次写入。
+
+下面的示例全部可在本机离线照做：使用独立数据目录 `/tmp/edgefleet-readme-dedup` 和固定接收时间，结果与何时执行无关。先保存一条心跳：
+
+```bash
+D=/tmp/edgefleet-readme-dedup
+rm -rf "$D"
+
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:05:00Z <<'EOF'
+[{"node":"counter","seq":1,"collected_at":"2026-10-02T00:00:00Z","version":"1.0","height":100,"missed":0}]
+EOF
+# submitted: new=1 duplicate=0
+```
+
+再提交一批 3 条：一条是刚才已保存的 seq 1，另外两条是完全相同的新心跳 seq 2：
+
+```bash
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:05:00Z <<'EOF'
+[
+  {"node":"counter","seq":1,"collected_at":"2026-10-02T00:00:00Z","version":"1.0","height":100,"missed":0},
+  {"node":"counter","seq":2,"collected_at":"2026-10-02T00:01:00Z","version":"1.0","height":101,"missed":0},
+  {"node":"counter","seq":2,"collected_at":"2026-10-02T00:01:00Z","version":"1.0","height":101,"missed":0}
+]
+EOF
+# submitted: new=1 duplicate=2
+```
+
+明明提交了 3 条，输出却是 `new=1 duplicate=2`：seq 1 已保存过，出现 1 次计 1 次重复；两条 seq 2 此前都没保存，第一条计新增、第二条计重复。真正写入磁盘的新记录只有 seq 2 这一条。历史查询可以直接对照“提交数量”与“保存数量”的区别——历史只比提交前多一条，且按序号升序展示：
+
+```bash
+go run ./cmd/edgefleet heartbeat history --data-dir "$D" --node counter
+# node=counter seq=1 collected_at=2026-10-02T00:00:00Z version=1.0 height=100 missed=0
+# node=counter seq=2 collected_at=2026-10-02T00:01:00Z version=1.0 height=101 missed=0
+```
+
+把已保存的 seq 2 换成另一时区写法再交一次，同一瞬间仍判重复，不新增：
+
+```bash
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:15:00Z <<'EOF'
+[{"node":"counter","seq":2,"collected_at":"2026-10-02T08:01:00+08:00","version":"1.0","height":101,"missed":0}]
+EOF
+# submitted: new=0 duplicate=1
+```
+
+不同节点使用相同序号互不冲突——三个节点各自的 seq 1 是三条独立记录，全部计新增：
+
+```bash
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:15:00Z <<'EOF'
+[
+  {"node":"peer-a","seq":1,"collected_at":"2026-10-02T00:10:00Z","version":"1.0","height":50,"missed":0},
+  {"node":"peer-b","seq":1,"collected_at":"2026-10-02T00:10:00Z","version":"1.0","height":60,"missed":0},
+  {"node":"peer-c","seq":1,"collected_at":"2026-10-02T00:10:00Z","version":"1.0","height":70,"missed":0}
+]
+EOF
+# submitted: new=3 duplicate=0
+```
+
+**冲突拒绝整批，且发生在任何写入之前。** 冲突可能出现在两个位置，两者处理完全相同：整批一条都不保存，命令以非零状态退出，错误写到 stderr，stdout 上既没有成功提示也没有 new/duplicate 计数。
+
+冲突就发生在本批内部：合法新心跳 seq 3（height 102）旁边混了同一身份但高度不同的另一条（height 999）：
+
+```bash
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:15:00Z \
+  >/tmp/ef-dedup.out 2>/tmp/ef-dedup.err <<'EOF'
+[
+  {"node":"counter","seq":3,"collected_at":"2026-10-02T00:02:00Z","version":"1.0","height":102,"missed":0},
+  {"node":"counter","seq":3,"collected_at":"2026-10-02T00:02:00Z","version":"1.0","height":999,"missed":0}
+]
+EOF
+echo "exit=$?"          # exit=1
+cat /tmp/ef-dedup.out   # 没有任何输出：没有成功提示，也没有 new/duplicate 计数
+cat /tmp/ef-dedup.err   # error: conflicting record for node "counter" seq 3: content differs
+```
+
+冲突也可能发生在输入与已有历史之间：合法新心跳 seq 4 旁边混了一条被改动过的旧记录 seq 1（height 从 100 改成 777）。同样整批拒绝——连那条合法的 seq 4 也不会保存，旧历史保持原样：
+
+```bash
+go run ./cmd/edgefleet heartbeat submit --data-dir "$D" --receive-time 2026-10-02T00:15:00Z \
+  >/tmp/ef-dedup.out 2>/tmp/ef-dedup.err <<'EOF'
+[
+  {"node":"counter","seq":4,"collected_at":"2026-10-02T00:03:00Z","version":"1.0","height":103,"missed":0},
+  {"node":"counter","seq":1,"collected_at":"2026-10-02T00:00:00Z","version":"1.0","height":777,"missed":0}
+]
+EOF
+echo "exit=$?"          # exit=1
+cat /tmp/ef-dedup.out   # 没有任何输出
+cat /tmp/ef-dedup.err   # error: conflicting record for node "counter" seq 1: content differs
+
+go run ./cmd/edgefleet heartbeat history --data-dir "$D" --node counter
+# 仍是 seq 1、seq 2 两条：seq 3 随批内冲突被拒，seq 4 也随整批被拒，均未保存
+# node=counter seq=1 collected_at=2026-10-02T00:00:00Z version=1.0 height=100 missed=0
+# node=counter seq=2 collected_at=2026-10-02T00:01:00Z version=1.0 height=101 missed=0
+```
+
+（通过 `go run` 运行时，stderr 在程序的错误行之后还会附带一行 `exit status 1`，那是 `go run` 对非零退出的包装，前文查询报错处同理；直接运行编译好的二进制只有程序自己的错误行。）
+
+**写入失败与冲突是两类不同的问题。** 冲突在写入之前完成判定，保证整批不动；写入失败则发生在已经开始落盘之后。各节点是独立文件、按节点逐个写入：中途某个节点写入失败（磁盘写满、目录权限、I/O 错误等）时命令会报告失败并以非零状态退出，但**排在它前面的节点的新记录可能已经保存成功，无法承诺把本批所有新增全部撤销**；此前已经保存的记录则始终保留、可查询。
+
+下面用只读目录确定性地制造一次写入失败（请以普通非 root 用户执行，root 会绕过权限位）：
+
+```bash
+F=/tmp/edgefleet-readme-fail
+rm -rf "$F"
+
+# 先保存一条旧记录
+go run ./cmd/edgefleet heartbeat submit --data-dir "$F" --receive-time 2026-10-02T00:20:00Z <<'EOF'
+[{"node":"alpha","seq":1,"collected_at":"2026-10-02T00:19:00Z","version":"1.0","height":100,"missed":0}]
+EOF
+# submitted: new=1 duplicate=0
+
+# 让 nodes 目录不可写，随后的每次落盘都会失败
+chmod 0500 "$F/nodes"
+go run ./cmd/edgefleet heartbeat submit --data-dir "$F" --receive-time 2026-10-02T00:20:00Z \
+  >/tmp/ef-fail.out 2>/tmp/ef-fail.err <<'EOF'
+[
+  {"node":"alpha","seq":2,"collected_at":"2026-10-02T00:19:30Z","version":"1.0","height":101,"missed":0},
+  {"node":"beta","seq":1,"collected_at":"2026-10-02T00:19:31Z","version":"1.0","height":200,"missed":0}
+]
+EOF
+echo "exit=$?"        # exit=1
+cat /tmp/ef-fail.out  # 没有任何输出
+cat /tmp/ef-fail.err  # error: failed to persist heartbeat batch: open /tmp/edgefleet-readme-fail/nodes/.tmp-XXXXXXXX: permission denied
+                      # （.tmp- 后是每次随机的临时文件名；go run 还会追加一行 exit status 1）
+chmod 0755 "$F/nodes" # 恢复可写，便于后续操作
+
+# 旧历史仍在；beta 在本构造中与 alpha 一样都写入失败，故无遥测
+go run ./cmd/edgefleet heartbeat history --data-dir "$F" --node alpha
+# node=alpha seq=1 collected_at=2026-10-02T00:19:00Z version=1.0 height=100 missed=0
+go run ./cmd/edgefleet heartbeat history --data-dir "$F" --node beta
+# node=beta no heartbeats
+```
+
+这个特定构造里每个节点的写入都会失败，所以两条新记录都没落盘；真实的中途失败可能停在任意节点之后，结果就是“部分节点已保存、部分未保存”。无论是全部未保存还是部分已保存，恢复手法都一样：**先用 history 逐节点确认各节点现状，再把原批次原样重新提交一次**——不必手工挑出哪些已经保存。下面构造出“alpha seq 2 已保存、beta seq 1 未保存”的现场，再原样重交上面失败的整批：
+
+```bash
+# 模拟失败停在 alpha 已落盘之后：先只把 alpha seq 2 保存好
+go run ./cmd/edgefleet heartbeat submit --data-dir "$F" --receive-time 2026-10-02T00:20:00Z <<'EOF'
+[{"node":"alpha","seq":2,"collected_at":"2026-10-02T00:19:30Z","version":"1.0","height":101,"missed":0}]
+EOF
+# submitted: new=1 duplicate=0
+
+# 原样重新提交当初失败的整批（alpha seq 2 + beta seq 1，内容一字不改）
+go run ./cmd/edgefleet heartbeat submit --data-dir "$F" --receive-time 2026-10-02T00:20:00Z <<'EOF'
+[
+  {"node":"alpha","seq":2,"collected_at":"2026-10-02T00:19:30Z","version":"1.0","height":101,"missed":0},
+  {"node":"beta","seq":1,"collected_at":"2026-10-02T00:19:31Z","version":"1.0","height":200,"missed":0}
+]
+EOF
+# submitted: new=1 duplicate=1
+```
+
+`new=1 duplicate=1` 正是期望结果：已保存的 alpha seq 2 计为重复、不再写入，尚未保存的 beta seq 1 计一次新增。原样重交天然幂等——同样的批次多交几遍只会让 duplicate 增加，绝不会产生第二条相同记录。最后用 history 确认各节点现状：
+
+```bash
+go run ./cmd/edgefleet heartbeat history --data-dir "$F" --node alpha
+# node=alpha seq=1 collected_at=2026-10-02T00:19:00Z version=1.0 height=100 missed=0
+# node=alpha seq=2 collected_at=2026-10-02T00:19:30Z version=1.0 height=101 missed=0
+go run ./cmd/edgefleet heartbeat history --data-dir "$F" --node beta
+# node=beta seq=1 collected_at=2026-10-02T00:19:31Z version=1.0 height=200 missed=0
+```
+
+注意两类故障的处理边界：冲突时绝不会发生部分写入（整批先判定、后落盘），冲突批次内容不改就原样重交仍会冲突；写入失败时才可能部分落盘，原样重交是标准恢复手段。这些计数不改变健康判断——健康查询仍以前文所述“序号最大的已保存记录”为准。
+
 ## 技术方向
 
 validator, node-monitoring, device-fleet, p2p-network, telemetry, devnet
