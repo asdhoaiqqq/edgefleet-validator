@@ -48,11 +48,21 @@ func livenessVersionFindings(online bool, version, expectedVersion string) []str
 	return findings
 }
 
+// missedExceedsTolerance is the single missed-duty alarm rule shared by
+// Evaluate and both store health query paths: the count alarms only when it
+// strictly exceeds the tolerance; equality does not. The comparison is done
+// in int64 so a cumulative counter beyond the int range (e.g. above 2^31-1
+// on 32-bit platforms, where Node.Missed cannot even hold it) is judged by
+// the full value the node reported, never a truncated or sign-flipped one.
+func missedExceedsTolerance(missed int64, toleratedMisses int) bool {
+	return missed > int64(toleratedMisses)
+}
+
 // Evaluate checks liveness, version skew and missed duties.
 func Evaluate(node Node, expectedVersion string, toleratedMisses int) Health {
 	health := Health{Node: node.ID, Healthy: true}
 	health.Findings = livenessVersionFindings(node.Online, node.Version, expectedVersion)
-	if node.Missed > toleratedMisses {
+	if missedExceedsTolerance(int64(node.Missed), toleratedMisses) {
 		health.Findings = append(health.Findings, missedAboveToleranceFinding)
 	}
 	health.Healthy = len(health.Findings) == 0

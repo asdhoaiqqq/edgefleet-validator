@@ -670,16 +670,16 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 
 	if !useBaseline {
 		// Cumulative judgement: the current counter must strictly exceed the
-		// tolerance. Evaluate holds this rule — and the shared online/version
-		// rules — in exactly one place for the demo and both query paths.
-		node := Node{
-			ID:      nodeID,
-			Version: latest.Version,
-			Height:  latest.Height,
-			Missed:  int(latest.Missed),
-			Online:  online,
+		// tolerance. The comparison uses the full int64 counter the node
+		// reported — narrowing it to int (as the demo's Node does) would
+		// truncate counts above the 32-bit range on 32-bit platforms and
+		// misjudge the alarm. The online and version-skew rules stay shared
+		// with Evaluate through livenessVersionFindings.
+		findings := livenessVersionFindings(online, latest.Version, expectedVersion)
+		if missedExceedsTolerance(latest.Missed, toleratedMisses) {
+			findings = append(findings, missedAboveToleranceFinding)
 		}
-		result.Findings = Evaluate(node, expectedVersion, toleratedMisses).Findings
+		result.Findings = findings
 		return result, nil
 	}
 
@@ -723,7 +723,7 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 		// No decrease was observed, so cumulative counts cannot have wrapped
 		// backwards within int64 range; the difference stays exact.
 		result.NewMissed = latest.Missed - baseline.Missed
-		if result.NewMissed > int64(toleratedMisses) {
+		if missedExceedsTolerance(result.NewMissed, toleratedMisses) {
 			findings = append(findings, missedAboveToleranceFinding)
 		}
 	}
