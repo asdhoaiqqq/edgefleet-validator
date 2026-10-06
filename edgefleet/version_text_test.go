@@ -333,7 +333,7 @@ func TestStoredInvalidVersionTextIsCorrupt(t *testing.T) {
 
 			// The file is refused as corrupt even though its checksum matches
 			// the replacement-char interpretation.
-			if _, err := loadNodeFile(path); err == nil || !IsCorrupt(err) {
+			if _, err := loadNodeFileFor(store, "bad"); err == nil || !IsCorrupt(err) {
 				t.Fatalf("read must report corruption, got %v", err)
 			} else if !strings.Contains(err.Error(), "record 1") || !strings.Contains(err.Error(), "version") {
 				t.Errorf("error must name record 1 and the version field, got: %v", err)

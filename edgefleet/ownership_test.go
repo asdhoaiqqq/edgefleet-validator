@@ -116,7 +116,7 @@ func TestForeignRecordAnywhereInFileIsCorrupt(t *testing.T) {
 			if err := writeNodeFile(path, tc.records); err != nil {
 				t.Fatal(err)
 			}
-			_, err := loadNodeFile(path)
+			_, err := loadNodeFileFor(store, "n1")
 			if err == nil || !IsCorrupt(err) {
 				t.Fatalf("read must report corruption, got %v", err)
 			}

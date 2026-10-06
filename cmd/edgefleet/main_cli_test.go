@@ -372,9 +372,16 @@ func TestCLIHealthBaselineOnNodeWithoutTelemetryFails(t *testing.T) {
 	}
 }
 
-// nodeFileHexPath mirrors the per-node file naming used by the store.
+// nodeFileHexPath mirrors the per-node file naming used by the store: short
+// ids live under nodes/hex(id).json; ids too long for a file name live under
+// slots/sha256(id).json.
 func nodeFileHexPath(dir, node string) string {
-	return filepath.Join(dir, "nodes", hex.EncodeToString([]byte(node))+".json")
+	hexName := hex.EncodeToString([]byte(node)) + ".json"
+	if len(hexName) <= 255 {
+		return filepath.Join(dir, "nodes", hexName)
+	}
+	sum := sha256.Sum256([]byte(node))
+	return filepath.Join(dir, "slots", hex.EncodeToString(sum[:])+".json")
 }
 
 // corruptNodeFile overwrites one node's saved file with raw content.

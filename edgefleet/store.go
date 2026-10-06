@@ -54,9 +54,25 @@ type nodeFile struct {
 // access the same directory concurrently: a flock on the directory lock file
 // serialises writers and lets queries take a shared lock, so a query never
 // observes a partially written batch.
+//
+// Node files live in two places chosen solely by the byte length of the node
+// id:
+//
+//   - Short ids keep their file at nodes/hex(nodeID)+".json", exactly as
+//     always; the file name itself decodes to the owning node id.
+//   - Long ids (those whose hex name would exceed the local file-name limit)
+//     keep their file at slots/<sha256(nodeID)>.json: a fixed-length content
+//     name that never grows with the id. The hash is computed over the whole
+//     id and only addresses the file — it never identifies the node — so a
+//     slot is loaded for a specific queried id and every record in it must
+//     declare that same id, the same ownership check a named hex file gets.
+//     A different id whose well-formed file is found at this slot (a planted
+//     foreign file) is refused as corruption rather than merged or read as
+//     this node's telemetry.
 type Store struct {
 	dir      string
 	nodesDir string
+	slotsDir string
 	lockPath string
 }
 
@@ -69,16 +85,87 @@ func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(nodesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create nodes directory %s: %w", nodesDir, err)
 	}
-	return &Store{dir: dir, nodesDir: nodesDir, lockPath: filepath.Join(dir, "lock")}, nil
+	slotsDir := filepath.Join(dir, "slots")
+	if err := os.MkdirAll(slotsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("cannot create slots directory %s: %w", slotsDir, err)
+	}
+	return &Store{
+		dir:      dir,
+		nodesDir: nodesDir,
+		slotsDir: slotsDir,
+		lockPath: filepath.Join(dir, "lock"),
+	}, nil
 }
 
 // Dir returns the data directory path.
 func (s *Store) Dir() string { return s.dir }
 
-// nodePath maps a node id to its per-node file. Hex encoding keeps arbitrary
-// node ids safe as filenames while remaining reversible.
+// maxNodeFileNameBytes is the local file-system name limit the store targets:
+// the base name of a short-id file is two hex characters per id byte plus the
+// ".json" suffix, and may use the full limit — every such name was writable
+// before long-id support existed, and keeping the limit at exactly this value
+// means every id that previously saved still uses its original file (no
+// rename, move or resubmit). Ids whose hex name would exceed the limit use a
+// fixed-length slot name instead; the limit never rejects an id — it only
+// selects where the file is placed.
+const maxNodeFileNameBytes = 255
+
+// nodeLocation is the one on-disk file holding one node's records.
+type nodeLocation struct {
+	path  string
+	owner string // the node id every record in the file must declare
+	named bool   // true: a legacy hex file whose name carries its owner; false: a hash-addressed slot whose owner is the queried id
+}
+
+// nodeLocationFor maps a node id to its storage location. The mapping depends
+// only on the exact id bytes — no trimming, whitespace handling or character
+// replacement — so two ids are stored apart unless their bytes are identical:
+// ids sharing a long prefix and differing at the end hash differently, and an
+// id submitted literally or via equivalent JSON escapes decodes to the same
+// bytes and maps to the same file. A short id's file name is its own hex,
+// which reversibly carries its owner; a long id's slot name is the full hash
+// of its bytes and carries no id text at all, so its owner is the queried id
+// itself.
+func (s *Store) nodeLocationFor(nodeID string) nodeLocation {
+	raw := []byte(nodeID)
+	hexName := hex.EncodeToString(raw) + ".json"
+	if len(hexName) <= maxNodeFileNameBytes {
+		return nodeLocation{
+			path:  filepath.Join(s.nodesDir, hexName),
+			owner: nodeID,
+			named: true,
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return nodeLocation{
+		path:  filepath.Join(s.slotsDir, hex.EncodeToString(sum[:])+".json"),
+		owner: nodeID,
+	}
+}
+
+// nodePath maps a node id to its per-node file. Short ids use a reversible hex
+// file name; ids too long for a file name use a fixed-length content-addressed
+// slot, so arbitrary-length legal Unicode ids never depend on a file name
+// being able to hold them.
 func (s *Store) nodePath(nodeID string) string {
-	return filepath.Join(s.nodesDir, hex.EncodeToString([]byte(nodeID))+".json")
+	return s.nodeLocationFor(nodeID).path
+}
+
+// nodeOwnerFromPath recovers the node id a *short-id* store file belongs to
+// from its file name: short-id files are named hex(nodeID)+".json", so the
+// owner is exactly the string the base name decodes to. Slot file names are
+// hashes that carry no node id; their owner is supplied by the caller (the id
+// being queried), not inferred from the name.
+func nodeOwnerFromPath(path string) (string, error) {
+	base := filepath.Base(path)
+	if !strings.HasSuffix(base, ".json") {
+		return "", fmt.Errorf("file name %q is not a per-node heartbeat file", base)
+	}
+	raw, err := hex.DecodeString(strings.TrimSuffix(base, ".json"))
+	if err != nil {
+		return "", fmt.Errorf("file name %q does not encode a node id: %w", base, err)
+	}
+	return string(raw), nil
 }
 
 // lock acquires the directory lock. Exclusive for writes, shared for reads.
@@ -110,41 +197,33 @@ func checksumRecords(records []Heartbeat) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// nodeIDFromPath recovers the node id a store file belongs to from its file
-// name: nodePath writes each node's records to hex(nodeID)+".json", so the
-// owner is exactly the string the base name decodes to. Node ids are compared
-// as the exact strings they are — ids containing Chinese characters, spaces
-// or slashes decode back unchanged and are never normalised or merged.
-func nodeIDFromPath(path string) (string, error) {
-	base := filepath.Base(path)
-	if !strings.HasSuffix(base, ".json") {
-		return "", fmt.Errorf("file name %q is not a per-node heartbeat file", base)
-	}
-	raw, err := hex.DecodeString(strings.TrimSuffix(base, ".json"))
-	if err != nil {
-		return "", fmt.Errorf("file name %q does not encode a node id: %w", base, err)
-	}
-	return string(raw), nil
-}
-
-// loadNodeFile reads and verifies the file for one node. A missing file means
-// the node has no records (returns nil, nil). Any parse, checksum, ownership
+// loadNodeFile reads and verifies the file at loc. A missing file means the
+// node has no records (returns nil, nil). Any parse, checksum, ownership
 // or structural failure is reported as a CorruptError.
 //
-// Ownership: the file belongs to exactly one node — the one encoded in its
-// file name — and every record in it must declare that same node id. A file
-// whose records name another node (for example another node's file copied
-// over this one, format and checksum still intact) is not that node's
-// telemetry: the whole file is refused as corrupt, no matter where the
-// foreign record sits in the history and even if the latest record happens
-// to name the right node.
+// Ownership: the file belongs to exactly one node — loc.owner — and every
+// record in it must declare that same node id. A file whose records name
+// another node (for example another node's file copied over this one, format
+// and checksum still intact) is not that node's telemetry: the whole file is
+// refused as corrupt, no matter where the foreign record sits in the history
+// and even if the latest record happens to name the right node.
+//
+// The two storage layouts prove ownership differently but enforce the exact
+// same rule. A legacy file under nodes/ is named hex(owner), so its owner is
+// decoded from the file name itself; that decoded id must also equal the id
+// being queried. A slot file under slots/ has a hash for a name that reveals
+// no node id, so its owner is the exact id whose slot this is — the full text
+// the user queried or submitted, never a truncated or normalised form.
+// Copying another node's complete file into a slot therefore fails just as
+// copying it onto a legacy file name does.
 //
 // The file is decoded with the same strict rules as submit input: every
 // telemetry field must be present, non-null and written once per record. A
 // checksum that matches the zero-filled interpretation of a tampered record
 // therefore cannot make a missing value look like real telemetry — the
 // record is rejected before the checksum is consulted.
-func loadNodeFile(path string) (*nodeFile, error) {
+func loadNodeFile(loc nodeLocation) (*nodeFile, error) {
+	path := loc.path
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -165,9 +244,18 @@ func loadNodeFile(path string) (*nodeFile, error) {
 	if got := checksumRecords(nf.Records); got != nf.Checksum {
 		return nil, &CorruptError{Path: path, Err: fmt.Errorf("checksum mismatch: stored %s, computed %s", nf.Checksum, got)}
 	}
-	owner, err := nodeIDFromPath(path)
-	if err != nil {
-		return nil, &CorruptError{Path: path, Err: err}
+	owner := loc.owner
+	if loc.named {
+		namedOwner, err := nodeOwnerFromPath(path)
+		if err != nil {
+			return nil, &CorruptError{Path: path, Err: err}
+		}
+		// The queried id and the file name must name the same owner.
+		if namedOwner != owner {
+			return nil, &CorruptError{Path: path, Err: fmt.Errorf(
+				"file name encodes node %q, but it was loaded for node %q",
+				namedOwner, owner)}
+		}
 	}
 	for i, r := range nf.Records {
 		if r.NodeID != owner {
@@ -410,13 +498,13 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 
 	// Merge with stored data per node, collecting new file contents.
 	type update struct {
-		path    string
+		loc     nodeLocation
 		records []Heartbeat
 	}
 	var updates []update
 	for nodeID, batch := range merged {
-		path := s.nodePath(nodeID)
-		nf, err := loadNodeFile(path)
+		loc := s.nodeLocationFor(nodeID)
+		nf, err := loadNodeFile(loc)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -437,13 +525,13 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 			}
 		}
 		sort.Slice(existing, func(i, j int) bool { return existing[i].Seq < existing[j].Seq })
-		updates = append(updates, update{path: path, records: existing})
+		updates = append(updates, update{loc: loc, records: existing})
 	}
 
 	// Persist. All updates are appends to previously verified data, so a
 	// failure here leaves every previously queryable record intact.
 	for _, u := range updates {
-		if err := writeNodeFile(u.path, u.records); err != nil {
+		if err := writeNodeFile(u.loc.path, u.records); err != nil {
 			return 0, 0, fmt.Errorf("failed to persist heartbeat batch: %w", err)
 		}
 	}
@@ -520,7 +608,7 @@ func (s *Store) health(nodeID string, at time.Time, expectedVersion string, tole
 	}
 	defer unlock()
 
-	nf, err := loadNodeFile(s.nodePath(nodeID))
+	nf, err := loadNodeFile(s.nodeLocationFor(nodeID))
 	if err != nil {
 		return HealthResult{}, err
 	}
@@ -633,7 +721,7 @@ func (s *Store) History(nodeID string) ([]Heartbeat, error) {
 	}
 	defer unlock()
 
-	nf, err := loadNodeFile(s.nodePath(nodeID))
+	nf, err := loadNodeFile(s.nodeLocationFor(nodeID))
 	if err != nil {
 		return nil, err
 	}

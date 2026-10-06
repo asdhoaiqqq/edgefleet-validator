@@ -24,6 +24,12 @@ func hb(node string, seq int64, collected time.Time, version string, height, mis
 	}
 }
 
+// loadNodeFileFor reads a node's file through the same location mapping and
+// verification the store uses, for tests that forge raw on-disk files.
+func loadNodeFileFor(store *Store, nodeID string) (*nodeFile, error) {
+	return loadNodeFile(store.nodeLocationFor(nodeID))
+}
+
 func TestParseHeartbeatsValid(t *testing.T) {
 	input := `[
 	  {"node":"val-1","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0.0","height":100,"missed":0},
@@ -1094,7 +1100,7 @@ func TestNodePathReversible(t *testing.T) {
 
 func TestValidateHeartbeatErrorMessage(t *testing.T) {
 	cases := []struct {
-		hb  Heartbeat
+		hb   Heartbeat
 		want string
 	}{
 		{hb("", 1, testBase, "1.0", 1, 0), "node"},

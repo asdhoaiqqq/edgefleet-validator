@@ -73,7 +73,7 @@ func TestStoredMissingFieldWithMatchingChecksumIsCorrupt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tamperedFile(t, path, tc.recordsJSON)
 
-			_, err := loadNodeFile(path)
+			_, err := loadNodeFileFor(store, "n1")
 			if err == nil || !IsCorrupt(err) {
 				t.Fatalf("read must report corruption, got %v", err)
 			}
@@ -119,7 +119,7 @@ func TestStoredNullFieldWithMatchingChecksumIsCorrupt(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tamperedFile(t, path, tc.recordsJSON)
-			_, err := loadNodeFile(path)
+			_, err := loadNodeFileFor(store, "n1")
 			if err == nil || !IsCorrupt(err) {
 				t.Fatalf("null %s must be corruption, got %v", tc.field, err)
 			}
@@ -165,7 +165,7 @@ func TestStoredDuplicateFieldWithMatchingChecksumIsCorrupt(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tamperedFile(t, path, tc.recordsJSON)
-			_, err := loadNodeFile(path)
+			_, err := loadNodeFileFor(store, "n1")
 			if err == nil || !IsCorrupt(err) {
 				t.Fatalf("duplicate %s must be corruption even with a matching checksum, got %v", tc.field, err)
 			}
@@ -194,7 +194,7 @@ func TestStoredCorruptionNamesRecordPosition(t *testing.T) {
 		`{"node":"n1","seq":2,"collected_at":"2026-10-01T11:59:30Z","version":"1.0","height":101},` +
 		`{"node":"n1","seq":3,"collected_at":"2026-10-01T11:59:45Z","version":"1.0","height":102,"missed":0}]`
 	tamperedFile(t, path, recordsJSON)
-	_, err = loadNodeFile(path)
+	_, err = loadNodeFileFor(store, "n1")
 	if err == nil {
 		t.Fatal("expected corruption")
 	}
@@ -241,7 +241,7 @@ func TestStoredEnvelopeTamperingIsCorrupt(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := loadNodeFile(path); err == nil || !IsCorrupt(err) {
+			if _, err := loadNodeFileFor(store, "n1"); err == nil || !IsCorrupt(err) {
 				t.Errorf("expected corruption, got %v", err)
 			}
 		})
