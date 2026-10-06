@@ -169,11 +169,13 @@ func TestAggregateAllIdleNeverProducedStaysUnknown(t *testing.T) {
 	// Internal state: every partition idle with no watermark ever reported
 	// yields no effective watermark.
 	s := &aggregateState{
-		windowMillis:  1000,
-		windows:       make(map[windowID]*windowState),
-		partitions:    2,
-		partWatermark: make(map[int64]*int64),
-		idle:          map[int64]bool{0: true, 1: true},
+		windowMillis: 1000,
+		windows:      make(map[windowID]*windowState),
+		partitions:   2,
+		partState: map[int64]*partitionWatermarkState{
+			0: {idle: true},
+			1: {idle: true},
+		},
 	}
 	if s.effectiveWatermark() != nil {
 		t.Fatal("effective watermark must stay unknown when all idle and none ever reported")
