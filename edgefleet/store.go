@@ -388,7 +388,13 @@ func validateStoredRecords(records []Heartbeat) error {
 // writeNodeFile persists records atomically: a temp file in the same
 // directory is fsynced and renamed over the target, so a crash never leaves
 // a half-written file.
-func writeNodeFile(path string, records []Heartbeat) error {
+//
+// It is a package-level function variable rather than a plain func only so the
+// persist stage can be deterministically failed from tests that exercise a
+// real, mid-batch persistence failure (some node files already renamed into
+// place before the failing one); production code always invokes the default
+// implementation below and never reassigns it.
+var writeNodeFile = func(path string, records []Heartbeat) error {
 	if records == nil {
 		records = []Heartbeat{}
 	}
