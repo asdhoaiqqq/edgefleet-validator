@@ -441,9 +441,195 @@ line 4: {"type":"watermark","time":1000}                          (无换行，�
 - 返回错误是 `line 3: invalid JSON record: invalid character 'o' in literal null (expecting 'u')`，可通过 `errors.As(err, *edgefleet.InputError)` 取到结构化的 `Line=3` 和 `Reason`；它**覆盖**了之后才获知的读取错误（此时 `errors.Is(err, errUpstream)` 为 `false`）。
 - 第 3 行之前没有任何窗口被关闭，所以 `out` 为空；`lateLog` 也为空。第 4 行尾部和读取故障都不会再被处理或上报。
 
-输出写出侧的失败规则与读取侧对称：窗口结果或迟到提示未能完整写出时，返回 `*edgefleet.OutputError`（可 `errors.Is` 到写出器自己的错误），触发它的物理行号、key 与窗口区间或迟到事件时间都会标明，已完整写出的内容保留。
+输出写出侧的失败规则与读取侧对称，但判定点不同：读取侧看的是读取器最后返回的错误身份，写出侧看的是结果接收端每次 `Write` 的字节数与错误。完整说明、可运行的离线示例与四种调用结果的实际输出见下一节《示例：通过 Go 库接收窗口结果——写出失败时如何判定调用结果》。
 
-以上规则均为现有产品行为，`edgefleet aggregate` 命令的用法、输入格式以及"输入结束时不补发未关闭窗口"的规则保持不变；库入口只是让调用方能够直接提供自己的 `io.Reader` 并按错误身份区分结束原因。
+以上规则均为现有产品行为，`edgefleet aggregate` 命令的用法、输入格式以及"输入结束时不补发未关闭窗口"的规则保持不变；库入口只是让调用方能够直接提供自己的 `io.Reader` / `io.Writer`，并按错误身份区分读取结束原因与写出失败。
+
+## 示例：通过 Go 库接收窗口结果——写出失败时如何判定调用结果
+
+上一节解决"输入侧"的问题：读取器交出字节和错误时哪些记录生效。本节解决对称的"输出侧"问题：**接收窗口结果的 `io.Writer` 已经收到了内容，这次聚合调用算不算成功**。入口仍是同一个库函数（固定窗口 `RunAggregate`；滑动、分区变体写出规则完全相同）：
+
+```go
+func RunAggregate(r io.Reader, windowMillis int64, out io.Writer, lateLog io.Writer) error
+```
+
+每个关闭窗口的结果是**一次** `out.Write` 调用写出的"完整 JSON 对象 + 行尾换行"（迟到提示同理，是一整行写入 `lateLog`）。本节示例代码位于 [`examples/aggregate-write/main.go`](examples/aggregate-write/main.go)，输入是内存里的 `strings.Reader`，输出是内存里的自定义 `io.Writer`，不碰文件、不连网络、不读当前时间：
+
+```bash
+go run ./examples/aggregate-write
+```
+
+### 一次结果写出的判定：字节数与错误分开看
+
+引擎对每条结果行只调用一次 `Write(p)`，`p` 是 JSON 加换行。这次写出**只有在 `err == nil` 且 `n == len(p)` 时才算成功**，两种失败形状必须分开：
+
+- **`Write` 返回了非空错误（无论收下了多少字节）**：本次聚合立即失败，错误被原样包进 `*edgefleet.OutputError`，可用 `errors.Is` 取出。即使 `n == len(p)`——接收端已经收下**整条 JSON 和行尾换行**——完整的字节数也不能抵消这个错误：该窗口仍按"未写出"处理。真实接收端（网络连接、管道、消息队列客户端）完全可能在同一次 `Write` 里既缓存/确认了完整载荷、又报告连接已坏，此时"字节齐全"不代表调用成功。
+- **`Write` 返回空错误但 `n < len(p)`**：内容没有写全，引擎以 `io.ErrShortWrite` 失败；它不会补写缺失的尾部，也不会再发一次。
+- **先收下一部分字节、又返回自己的错误时**：收下的前缀原样保留，报告的是接收端**自己的原始错误**，而不是 `io.ErrShortWrite`（短写错误只用于"空错误 + 字节不足"这一种形状）。
+
+失败时调用方拿到的是 `*edgefleet.OutputError`，字段含义固定：
+
+| 字段 | 含义 |
+| --- | --- |
+| `Line` | 触发这次写出的**物理输入行号**（水位线行，或迟到事件自己的行；空行也占行号） |
+| `Kind` | 写出内容类别：`"window result"`（窗口结果）或 `"late-event notice"`（迟到提示） |
+| `Detail` | 记录定位：窗口结果为 `key "k" window [start,end)`；迟到提示为 `event time T below current watermark W` |
+| `Err` | 接收端自己的错误（含只收下前缀就失败的情况），空错误短写时为 `io.ErrShortWrite`；`Unwrap` 让 `errors.Is` 生效 |
+
+典型的调用方判定代码：
+
+```go
+var oe *edgefleet.OutputError
+if errors.As(err, &oe) {
+    // oe.Line / oe.Kind / oe.Detail 定位是哪条输入触发的哪条结果没写全
+    switch {
+    case errors.Is(err, io.ErrShortWrite):
+        // 接收端没报错，但结果行没收全
+    case errors.Is(err, errSink):
+        // 接收端自己的错误（即使它已收完整条行）
+    }
+}
+```
+
+失败一旦发生，引擎**立即停止**：不重发失败内容、不继续输出同一批里其余已就绪窗口、不再读取和处理后续输入记录，输入结束也不补发仍未关闭的窗口。接收端已经收下的字节**原样保留**——此前成功写出的完整结果行继续有效；失败那次 `Write` 收下的字节（一条伴随错误的完整行，或一个截断片段）也物理留在原处，**是否把它们当成已确认结果由调用方负责**：没有行尾换行的片段一定不是完整结果行；而一条字节完整、却伴随错误返回的行同样不能算作成功写出。
+
+### 同一份输入：一条水位线关闭多个窗口
+
+示例把**同一份** 11 行的逐行 JSON 输入喂给 `RunAggregate(reader, 1000, out, lateLog)` 四次。窗口是 1000 毫秒固定窗口：`[0,1000)`、`[1000,2000)`、`[2000,3000)`，左闭右开。同一批关闭的结果按 **end 升序、再按 key 的 UTF-8 字节序**输出，所以每条水位线对三个 key 的输出顺序都是 `a`、`b`、`c`。输入在代码里就是一个内存字符串常量（空行写成 `` ``，仍然占物理行号）：
+
+```go
+const input = "" +
+	`{"type":"event","key":"a","time":100,"value":11}` + "\n" +  // 第 1 行
+	`` + "\n" +                                                  // 第 2 行：空行
+	`{"type":"event","key":"b","time":200,"value":22}` + "\n" +  // 第 3 行
+	`{"type":"event","key":"c","time":300,"value":33}` + "\n" +  // 第 4 行
+	`{"type":"watermark","time":1000}` + "\n" +                  // 第 5 行
+	`{"type":"event","key":"a","time":1100,"value":44}` + "\n" + // 第 6 行
+	`{"type":"event","key":"b","time":1200,"value":55}` + "\n" + // 第 7 行
+	`` + "\n" +                                                  // 第 8 行：空行
+	`{"type":"event","key":"c","time":1300,"value":66}` + "\n" + // 第 9 行
+	`{"type":"event","key":"a","time":2100,"value":77}` + "\n" + // 第 10 行
+	`{"type":"watermark","time":3000}` + "\n"                    // 第 11 行
+```
+
+逐行对应到窗口与触发写出的水位线（行号即物理行号，第 2、8 行空行也占号）：
+
+- 第 1、3、4 行：三个 key 各来一条事件，时间 100/200/300 都在 `[0,1000)` 内，分别累计为 `a: sum=11`、`b: sum=22`、`c: sum=33`。此时没有水位线，没有输出。
+- **第 5 行：水位线 1000，一次关闭 `[0,1000)` 的三个窗口**，按 key 序连续写出三行：先 `a`、再 `b`、再 `c`。示例就在**中间那条 `b` 的结果行**上注入写出故障——它前面有一条已成功的 `a`，后面还有一条本可输出的 `c`，三者由同一条水位线触发。
+- 第 6、7、9 行：`a/b/c` 在 `[1000,2000)` 内的事件（`sum=44/55/66`）；第 10 行：`a` 在 `[2000,3000)` 内的事件（`sum=77`）。
+- 第 11 行：水位线 3000，本会再关闭四个窗口（`[1000,2000)` 的 `a/b/c` 和 `[2000,3000)` 的 `a`）。**只有成功对照能跑到这里**：三种失败都在第 5 行就中止，引擎连第 6～11 行都不会再读取——尽管这些字节早已在内存输入中。
+
+### 对照：全部写出成功，返回 `nil` 并显示全部应关闭窗口
+
+接收端是一个普通内存缓冲区，两条水位线共触发 7 次 `Write`、7 条结果，全部完整，返回错误为 `nil`。注意第 11 行水位线关闭的四个窗口（含 `[2000,3000)`）都在：
+
+```text
+=== 1. healthy control: every result is written in full ===
+complete result lines retained from SUCCESSFUL writes:
+  {"key":"a","start":0,"end":1000,"count":1,"sum":11}
+  {"key":"b","start":0,"end":1000,"count":1,"sum":22}
+  {"key":"c","start":0,"end":1000,"count":1,"sum":33}
+  {"key":"a","start":1000,"end":2000,"count":1,"sum":44}
+  {"key":"b","start":1000,"end":2000,"count":1,"sum":55}
+  {"key":"c","start":1000,"end":2000,"count":1,"sum":66}
+  {"key":"a","start":2000,"end":3000,"count":1,"sum":77}
+failed write: (none)
+result writer Write calls attempted: 7
+late-event notice stream (lateLog): (none)
+returned error: <nil>
+  errors.As(*edgefleet.OutputError) -> false (the run was not stopped by an output failure)
+```
+
+### 失败一：已接收整条 JSON 和换行，仍返回自己的错误
+
+接收端对 `b` 的那次 `Write` 收下全部 52 个字节（51 字节 JSON 加 1 字节换行）并返回错误 `sink connection broken while acknowledging result`。调用仍然失败：**完整字节数不能抵消错误**。此前 `a` 那一行来自成功的 `Write`，是唯一已确认结果；`b` 的字节虽然物理完整，但它来自一次报错的调用，单列在"FAILED write"下，不能当成有效窗口结果；同批的 `c`、以及第 11 行本可输出的窗口全部没有写出，第 6～11 行未被处理：
+
+```text
+=== 2. whole result line accepted, but the writer returns its own error ===
+complete result lines retained from SUCCESSFUL writes:
+  {"key":"a","start":0,"end":1000,"count":1,"sum":11}
+failing Write returned: n=52 of 52 byte(s), err=sink connection broken while acknowledging result
+bytes retained from the FAILED write (not a confirmed result):
+  raw: "{\"key\":\"b\",\"start\":0,\"end\":1000,\"count\":1,\"sum\":22}\n"
+  decoded: {"key":"b","start":0,"end":1000,"count":1,"sum":22}
+  -> the full JSON object AND its trailing newline are physically present, but the Write
+     returned an error; the complete byte count does not cancel it and the engine treats
+     this window as not written.
+result writer Write calls attempted: 2
+late-event notice stream (lateLog): (none)
+returned error: line 5: window result not fully written (key "b" window [0,1000)): sink connection broken while acknowledging result
+  errors.As(*edgefleet.OutputError) -> true
+    oe.Line   = 5 (the physical input line that triggered this write; blank lines count)
+    oe.Kind   = "window result"
+    oe.Detail = "key \"b\" window [0,1000)"
+    -> window result for key="b" interval=[0,1000)
+    oe.Err    = sink connection broken while acknowledging result
+  errors.Is(err, errSink)      -> true (the result writer's own error)
+  errors.Is(err, io.ErrShortWrite) -> false (nil error but the full result was not accepted)
+```
+
+### 失败二：只接收部分字节却返回空错误 → `io.ErrShortWrite`
+
+接收端只收下 52 个字节中的前 20 个、返回 `nil`。引擎以 `io.ErrShortWrite` 表明内容未写全；残留片段 `{"key":"b","start":0` 没有行尾换行，**不是**一条有效窗口结果。`errors.Is(err, io.ErrShortWrite)` 为 `true`，接收端自己的错误哨兵为 `false`：
+
+```text
+=== 3. only a prefix accepted with a nil error: io.ErrShortWrite ===
+complete result lines retained from SUCCESSFUL writes:
+  {"key":"a","start":0,"end":1000,"count":1,"sum":11}
+failing Write returned: n=20 of 52 byte(s), err=<nil>
+bytes retained from the FAILED write (not a confirmed result):
+  raw: "{\"key\":\"b\",\"start\":0"
+  decoded prefix: {"key":"b","start":0
+  -> a truncated fragment with no terminating newline; it is not a valid window result line.
+result writer Write calls attempted: 2
+late-event notice stream (lateLog): (none)
+returned error: line 5: window result not fully written (key "b" window [0,1000)): short write
+  errors.As(*edgefleet.OutputError) -> true
+    oe.Line   = 5 (the physical input line that triggered this write; blank lines count)
+    oe.Kind   = "window result"
+    oe.Detail = "key \"b\" window [0,1000)"
+    -> window result for key="b" interval=[0,1000)
+    oe.Err    = short write
+  errors.Is(err, errSink)      -> false (the result writer's own error)
+  errors.Is(err, io.ErrShortWrite) -> true (nil error but the full result was not accepted)
+```
+
+### 失败三：接收部分字节并返回自己的错误 → 保留原始错误
+
+同样只收下前 20 个字节，但这次 `Write` 还返回了接收端自己的错误。片段照样保留，而 `OutputError.Err` 是那个**原始错误**，不会被替换成 `io.ErrShortWrite`——两种短写形状靠"伴随的错误是否为空"区分：
+
+```text
+=== 4. prefix accepted together with the writer's own error ===
+complete result lines retained from SUCCESSFUL writes:
+  {"key":"a","start":0,"end":1000,"count":1,"sum":11}
+failing Write returned: n=20 of 52 byte(s), err=sink connection broken while acknowledging result
+bytes retained from the FAILED write (not a confirmed result):
+  raw: "{\"key\":\"b\",\"start\":0"
+  decoded prefix: {"key":"b","start":0
+  -> a truncated fragment with no terminating newline; it is not a valid window result line.
+result writer Write calls attempted: 2
+late-event notice stream (lateLog): (none)
+returned error: line 5: window result not fully written (key "b" window [0,1000)): sink connection broken while acknowledging result
+  errors.As(*edgefleet.OutputError) -> true
+    oe.Line   = 5 (the physical input line that triggered this write; blank lines count)
+    oe.Kind   = "window result"
+    oe.Detail = "key \"b\" window [0,1000)"
+    -> window result for key="b" interval=[0,1000)
+    oe.Err    = sink connection broken while acknowledging result
+  errors.Is(err, errSink)      -> true (the result writer's own error)
+  errors.Is(err, io.ErrShortWrite) -> false (nil error but the full result was not accepted)
+```
+
+四种结果放在一起对照：
+
+| 场景 | 失败 `Write` 的 `(n, err)` | 返回错误 | 已保留内容 | 同批/后续窗口 |
+| --- | --- | --- | --- | --- |
+| 1 正常对照 | 无失败 | `nil` | 全部 7 行 | 全部输出 |
+| 2 整行 + 自己的错误 | `n=52/52, err=errSink` | `*OutputError` 包 `errSink` | 成功写出的 `a` 行；报错调用留下的完整 `b` 行（不计为成功） | 不再输出 |
+| 3 前缀 + 空错误 | `n=20/52, err=nil` | `*OutputError` 包 `io.ErrShortWrite` | 成功写出的 `a` 行；20 字节片段 | 不再输出 |
+| 4 前缀 + 自己的错误 | `n=20/52, err=errSink` | `*OutputError` 包 `errSink`（原始错误保留） | 成功写出的 `a` 行；20 字节片段 | 不再输出 |
+
+本例没有迟到事件，所以 `lateLog` 始终为空；迟到提示写不全时走的是同一套规则，只是 `Kind` 为 `"late-event notice"`、`Detail` 标明被跳过的事件时间与所用水位线，`Line` 是那条迟到事件自己的物理行号。以上均为现有产品行为：命令行用法不变，上一节的读取失败示例 [`examples/aggregate-read`](examples/aggregate-read/main.go) 继续可用，本节只是为写出侧补齐可离线运行的对照示例与判定说明。
 
 ## 技术方向
 
