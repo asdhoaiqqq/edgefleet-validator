@@ -303,18 +303,44 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 // overflow checks and end-of-input behavior are otherwise identical to
 // RunAggregateSliding.
 func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
+	return RunAggregatePartitionedSlidingMaxOpenWindows(r, windowMillis, slideMillis, partitions, 0, out, lateLog)
+}
+
+// RunAggregatePartitionedSlidingMaxOpenWindows is
+// RunAggregatePartitionedSliding with an optional cap on how many aggregate
+// windows may be open at once, for inputs whose watermark stalls while
+// distinct keys keep arriving. maxOpenWindows <= 0 selects the existing
+// unlimited behavior; a positive value limits the number of retained
+// aggregation records, counted as one slot per (decoded key, window interval)
+// combination currently open -- never per event and never per partition.
+// Events for a combination that is already open only add to that window's
+// count and sum and are always accepted, even when every slot is taken. A
+// valid, non-late event whose containing windows would need more new
+// combinations than the remaining slots fails its whole physical input line
+// with *InputError naming the line, the event key, the number of slots
+// currently in use, the number of new slots the event would need and the
+// configured limit; the event then enters no window at all, no window is
+// closed early to make room and no existing aggregation data is dropped. An
+// event that exactly reaches the limit is accepted. A slot is released only
+// when its window closes under the existing watermark rules and its result
+// has been written in full; a partition going idle frees nothing by itself,
+// only the window closures its watermark advance triggers do. Late events
+// are skipped before the limit is consulted and neither consume slots nor
+// are ever reported as a limit overflow.
+func RunAggregatePartitionedSlidingMaxOpenWindows(r io.Reader, windowMillis, slideMillis, partitions, maxOpenWindows int64, out io.Writer, lateLog io.Writer) error {
 	if err := ValidateAggregateParams(windowMillis, slideMillis, partitions); err != nil {
 		return err
 	}
 	s := &aggregateState{
-		windowMillis:  windowMillis,
-		slideMillis:   slideMillis,
-		windows:       make(map[windowID]*windowState),
-		out:           out,
-		lateLog:       lateLog,
-		partitions:    partitions,
-		partWatermark: make(map[int64]*int64),
-		idle:          make(map[int64]bool),
+		windowMillis:   windowMillis,
+		slideMillis:    slideMillis,
+		windows:        make(map[windowID]*windowState),
+		out:            out,
+		lateLog:        lateLog,
+		partitions:     partitions,
+		partWatermark:  make(map[int64]*int64),
+		idle:           make(map[int64]bool),
+		maxOpenWindows: maxOpenWindows,
 		// Every partition starts out active and unreported; in legacy mode
 		// (partitions == 0) the counter stays zero and is never consulted.
 		unreportedActive: partitions,
@@ -491,6 +517,12 @@ type aggregateState struct {
 	// being declared idle, and resuming from idle always happens through a
 	// watermark record, which reports at the same moment.
 	unreportedActive int64
+
+	// maxOpenWindows caps how many (key, window) combinations may be open at
+	// once; <= 0 means unlimited. The current occupancy is exactly
+	// len(s.windows): a combination holds its slot from the event that first
+	// creates it until its window closes and its result is fully written.
+	maxOpenWindows int64
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
@@ -771,10 +803,11 @@ func (s *aggregateState) acceptEvent(ev eventRecord, lineNo int) error {
 // its event time, one count and the full value per window. It only mutates
 // window state; the caller has already settled field validity, idleness and
 // lateness. The containing-window range is derived once and shared by the
-// window-end overflow precheck and the counting loop, so both judge the exact
-// same set of windows. The precheck runs before any window is touched;
-// per-window count and sum overflows then fail on this triggering event in
-// ascending window-start order rather than at watermark closure.
+// window-end overflow precheck, the open-window limit precheck and the
+// counting loop, so all three judge the exact same set of windows. The
+// prechecks run before any window is touched; per-window count and sum
+// overflows then fail on this triggering event in ascending window-start
+// order rather than at watermark closure.
 func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
 	wins := s.containingWindows(ev.time)
 
@@ -782,6 +815,25 @@ func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
 	// whole input line; check before updating any window state.
 	if wins.firstOverflow >= 0 {
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, wins.firstOverflow, s.windowMillis)}
+	}
+
+	// With an open-window limit configured, a combination already open is
+	// always free to take the event; only a (key, window) combination this
+	// event would create needs a slot. The check runs before any window is
+	// touched, so a line that would exceed the limit fails whole: the event
+	// enters none of its containing windows, no window is closed early to
+	// make room and no existing aggregation is dropped. Reaching the limit
+	// exactly is still accepted.
+	if s.maxOpenWindows > 0 {
+		var needed int64
+		for i := wins.count - 1; i >= 0; i-- {
+			if s.windows[windowID{start: wins.start(i), key: ev.key}] == nil {
+				needed++
+			}
+		}
+		if open := int64(len(s.windows)); open+needed > s.maxOpenWindows {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("open window limit exceeded for key %q: %d window slot(s) currently open, this event needs %d new slot(s), limit is %d", ev.key, open, needed, s.maxOpenWindows)}
+		}
 	}
 
 	// Add the event once to each containing window, in ascending start
