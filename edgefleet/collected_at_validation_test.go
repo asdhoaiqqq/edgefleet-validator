@@ -315,3 +315,233 @@ func TestStoredOutOfRangeHourOffsetFileIsCorrupt(t *testing.T) {
 		t.Errorf("corruption error must name record 1 and collected_at, got %v", err)
 	}
 }
+
+// TestParseHeartbeatsRejectsSubNanosecondFraction pins the reported
+// regression: time.Parse silently truncates fractional seconds beyond the
+// ninth digit, so ".1234567891" and ".1234567892" would both save as the
+// instant ".123456789" and two genuinely different collection moments would
+// merge into one record. Any non-zero digit past the ninth must be rejected
+// — never truncated or rounded — with an error naming the record position,
+// collected_at and the precision problem.
+func TestParseHeartbeatsRejectsSubNanosecondFraction(t *testing.T) {
+	receive := testBase
+	cases := []struct {
+		name  string
+		stamp string
+	}{
+		{"tenth digit non-zero", "2026-10-01T11:59:00.1234567891Z"},
+		{"tenth digit non-zero with offset", "2026-10-01T11:59:00.1234567891+08:00"},
+		{"eleventh digit non-zero after zero tenth", "2026-10-01T11:59:00.12345678901Z"},
+		{"trailing non-zero far out", "2026-10-01T11:59:00.000000000000001Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `[{"node":"n1","seq":1,"collected_at":"` + tc.stamp + `","version":"1.0","height":1,"missed":0}]`
+			records, err := ParseHeartbeats([]byte(input), receive)
+			if err == nil {
+				t.Fatalf("sub-nanosecond fraction %q must be rejected, got nil", tc.stamp)
+			}
+			if records != nil {
+				t.Errorf("no partial records may be returned, got %v", records)
+			}
+			msg := err.Error()
+			for _, want := range []string{"record 1", "collected_at", "fractional seconds", "nanosecond"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error %q must mention %q", msg, want)
+				}
+			}
+		})
+	}
+
+	// A JSON-escaped spelling of the same text decodes to the same string and
+	// must get the identical verdict: the tenth digit written as the
+	// escape '1' still carries the unrepresentable precision.
+	escaped := `[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00.123456789\u0031Z","version":"1.0","height":1,"missed":0}]`
+	if _, err := ParseHeartbeats([]byte(escaped), receive); err == nil {
+		t.Errorf("escaped spelling of the same unrepresentable fraction must be rejected identically")
+	}
+}
+
+// TestParseHeartbeatsAcceptsExactNanosecondFractions pins the legal forms: no
+// fraction, up to nine digits, and longer fractions whose digits past the
+// ninth are all zero — ".1234567890" is exactly ".123456789" and decodes to
+// the same instant.
+func TestParseHeartbeatsAcceptsExactNanosecondFractions(t *testing.T) {
+	cases := []struct {
+		name  string
+		stamp string
+		want  string // canonical instant it must decode to
+	}{
+		{"no fraction", "2026-10-01T11:59:00Z", "2026-10-01T11:59:00Z"},
+		{"one digit", "2026-10-01T11:59:00.1Z", "2026-10-01T11:59:00.1Z"},
+		{"nine digits", "2026-10-01T11:59:00.123456789Z", "2026-10-01T11:59:00.123456789Z"},
+		{"ten digits trailing zero", "2026-10-01T11:59:00.1234567890Z", "2026-10-01T11:59:00.123456789Z"},
+		{"many trailing zeros", "2026-10-01T11:59:00.12345678900000Z", "2026-10-01T11:59:00.123456789Z"},
+		{"trailing zeros with offset", "2026-10-01T11:59:00.5000000000+08:00", "2026-10-01T11:59:00.5+08:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `[{"node":"n1","seq":1,"collected_at":"` + tc.stamp + `","version":"1.0","height":1,"missed":0}]`
+			records, err := ParseHeartbeats([]byte(input), testBase)
+			if err != nil {
+				t.Fatalf("exactly representable fraction %q must be accepted, got %v", tc.stamp, err)
+			}
+			want, perr := time.Parse(time.RFC3339, tc.want)
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			if !records[0].CollectedAt.Equal(want) {
+				t.Errorf("%q decoded to %v, want %v", tc.stamp, records[0].CollectedAt, want)
+			}
+		})
+	}
+}
+
+// TestSubmitSubNanosecondFractionRejectsWholeBatch mirrors the whole-batch
+// guarantee for the precision rule: a record whose collected_at cannot be
+// saved exactly fails the parse of the entire batch — no partial records are
+// returned — even when its truncated form would exactly match a record
+// already saved for that node and seq (it must be refused as invalid input,
+// never counted as a duplicate of the saved one).
+func TestSubmitSubNanosecondFractionRejectsWholeBatch(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+
+	// "old" already has a record collected at exactly 11:58:00.123456789.
+	saved := hb("old", 1, time.Date(2026, 10, 1, 11, 58, 0, 123456789, time.UTC), "1.0", 100, 0)
+	if _, _, err := store.Submit([]Heartbeat{saved}, receive); err != nil {
+		t.Fatal(err)
+	}
+	oldBefore, err := os.ReadFile(store.nodePath("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The offending record's truncated form would equal the saved instant of
+	// "old" seq 1; it must still fail as invalid input, and the legal record
+	// ahead of it must not survive either.
+	bad := `{"node":"old","seq":1,"collected_at":"2026-10-01T11:58:00.1234567891Z","version":"1.0","height":100,"missed":0}`
+	good := `{"node":"fresh","seq":1,"collected_at":"2026-10-01T11:59:00Z","version":"1.0","height":1,"missed":0}`
+	records, err := ParseHeartbeats([]byte("["+good+","+bad+"]"), receive)
+	if err == nil {
+		t.Fatal("batch with a sub-nanosecond fraction must be rejected at parse")
+	}
+	if records != nil {
+		t.Errorf("no partial records may be returned, got %v", records)
+	}
+	msg := err.Error()
+	for _, want := range []string{"record 2", "collected_at", "fractional seconds"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q must mention %q", msg, want)
+		}
+	}
+
+	// Nothing was submitted, so the store is exactly as before.
+	if after, rerr := os.ReadFile(store.nodePath("old")); rerr != nil || string(after) != string(oldBefore) {
+		t.Fatalf("existing node file changed: err=%v", rerr)
+	}
+	if _, serr := os.Stat(store.nodePath("fresh")); !os.IsNotExist(serr) {
+		t.Errorf("no file may be created for fresh, stat err=%v", serr)
+	}
+}
+
+// TestStoredSubNanosecondFractionFileIsCorrupt forges a node file whose raw
+// JSON carries a fraction time.Parse would truncate, with a checksum matching
+// the truncated interpretation (exactly what a lenient reader reconstructs).
+// Every query must report corruption naming the record and the collected_at
+// precision problem, and a submit touching the node must refuse the whole
+// batch without overwriting the file.
+func TestStoredSubNanosecondFractionFileIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	path := store.nodePath("n1")
+	tamperedFile(t, path, `[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00.1234567891Z","version":"1.0","height":100,"missed":0}]`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadNodeFileFor(store, "n1")
+	if err == nil || !IsCorrupt(err) {
+		t.Fatalf("sub-nanosecond stored fraction must be corruption, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"record 1", "collected_at", "fractional seconds", "nanosecond"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("corruption error must mention %q, got %v", want, err)
+		}
+	}
+	if _, err := store.Health("n1", receive, "1.0", 0); err == nil || !IsCorrupt(err) {
+		t.Errorf("health must refuse the unrepresentable instant, got %v", err)
+	}
+	if _, err := store.History("n1"); err == nil || !IsCorrupt(err) {
+		t.Errorf("history must refuse the unrepresentable instant, got %v", err)
+	}
+
+	// Submitting to the corrupt node refuses the whole batch and leaves the
+	// file exactly as found.
+	_, _, err = store.Submit([]Heartbeat{hb("n1", 2, receive.Add(-time.Second), "1.0", 101, 0)}, receive)
+	if err == nil || !IsCorrupt(err) {
+		t.Fatalf("submit touching the corrupt node must be refused, got %v", err)
+	}
+	if after, rerr := os.ReadFile(path); rerr != nil || string(after) != string(before) {
+		t.Fatalf("corrupt file was overwritten: err=%v", rerr)
+	}
+}
+
+// TestStoredTrailingZeroFractionFileStaysReadable proves the legal long form
+// on disk: a hand-written record whose fraction only adds trailing zeros past
+// the ninth digit decodes to the same nanosecond instant and stays readable.
+func TestStoredTrailingZeroFractionFileStaysReadable(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := store.nodePath("n1")
+	collected := time.Date(2026, 10, 1, 11, 59, 0, 123456789, time.UTC)
+	tamperedFile(t, path, `[{"node":"n1","seq":1,"collected_at":"2026-10-01T11:59:00.1234567890Z","version":"1.0","height":100,"missed":0}]`)
+
+	hist, err := store.History("n1")
+	if err != nil {
+		t.Fatalf("trailing-zero fraction must stay readable: %v", err)
+	}
+	if len(hist) != 1 || !hist[0].CollectedAt.Equal(collected) {
+		t.Fatalf("stored instant changed: %+v", hist)
+	}
+}
+
+// TestSameSeqOneNanosecondApartConflicts pins the instant comparison at full
+// nanosecond resolution: two legal records for the same node and seq whose
+// collection times differ by a single nanosecond are a content conflict, not
+// a duplicate.
+func TestSameSeqOneNanosecondApartConflicts(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testBase
+	base := time.Date(2026, 10, 1, 11, 59, 0, 123456789, time.UTC)
+	if _, _, err := store.Submit([]Heartbeat{hb("n1", 1, base, "1.0", 100, 0)}, receive); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Submit([]Heartbeat{hb("n1", 1, base.Add(time.Nanosecond), "1.0", 100, 0)}, receive)
+	if err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("records one nanosecond apart must conflict, got %v", err)
+	}
+	hist, herr := store.History("n1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if len(hist) != 1 || !hist[0].CollectedAt.Equal(base) {
+		t.Errorf("conflict must not overwrite the saved record: %+v", hist)
+	}
+}
