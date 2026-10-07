@@ -247,6 +247,126 @@ exit=1
 
 若改用 `go run ./cmd/edgefleet ...` 运行，`go run` 对非零退出统一报成退出码 1 并多打印一行 `exit status 1`；这里程序自身退出码本就是 1，构建二进制后即可直接观察到上面的结果。
 
+## 示例：同一事件顶层出现两个 key 字段——必须失败，不能任选一个值继续
+
+前面各节都假定每条事件只有一个顶层 `key` 字段。本节说明新增的输入校验：**一条 event 记录的顶层只允许出现一次名为 `key` 的字段**。此前若把 `key` 写两遍，JSON 解码会静默保留后一个值、丢掉前一个值，程序就拿后者继续检查与分组；现在遇到这种记录会明确失败（退出码 1），即使两个字符串完全相同也算重复。重复判断以 **JSON 解码后的字段名** 为准，检查范围**只限该事件记录的顶层**，并且重复字段在所有其他检查之前被拒绝。
+
+### 失败示例：重复 key 先于字段合法性、分区状态与迟到判断
+
+固定窗口 1000 毫秒、单水位线（省略 `--slide-ms` 与 `--partitions`），共 5 行（其中第 3 行为空行）。命令可直接离线运行，并用构建出的二进制观察程序自身退出码：
+
+```bash
+go build -o /tmp/edgefleet ./cmd/edgefleet
+printf '%s\n' \
+  '{"type":"event","key":"ok","time":100,"value":5}' \
+  '{"type":"watermark","time":1000}' \
+  '' \
+  '{"type":"event","key":"a","key":"b","time":999,"value":9}' \
+  '{"type":"watermark","time":2000}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+echo "exit=$?"
+```
+
+终端里标准输出（第 2 行水位线触发）先于标准错误（第 4 行记录触发）。分开列出：完整标准输出只有出错之前已经完整关闭并写出的那一个窗口：
+
+```json
+{"key":"ok","start":0,"end":1000,"count":1,"sum":5}
+```
+
+完整标准错误恰好一行，指出**物理输入行号**、`key` 字段与重复原因：
+
+```
+aggregate: line 4: field "key" appears more than once at the top level of an event record; remove the duplicate field
+```
+
+程序自身退出码为 1：
+
+```
+exit=1
+```
+
+逐行说明（行号即物理输入行号，空行也占行号）：
+
+- 第 1 行：合法事件，进入窗口 `[0,1000)`。
+- 第 2 行：水位线 1000 关闭 `[0,1000)`，写出 `count=1、sum=5`，当前水位线变为 1000。**这一行结果已完整写出，出错后原样保留。**
+- 第 3 行：空行，照常忽略，但**仍占一个物理行号**，所以出错记录是第 4 行而不是第 3 行。
+- 第 4 行：**物理第 4 行**即出错行。顶层把 `key` 写了两遍（值分别为 `"a"` 和 `"b"`）。程序不再像以前那样"用后一个值 `"b"` 继续"，而是直接判定整条记录失败：它**不贡献任何计数或求和**，即使它的事件时间 999 严格低于当前水位线 1000，也**不会**降级成普通迟到事件那种"在标准错误写一行迟到提示、跳过、继续运行（退出码 0）"——重复字段检查先于字段合法性、分区状态和迟到判断。
+- 第 5 行：致命错误之后不再处理后续记录，这条水位线 2000 不会被读取，也**不会补发**任何仍未关闭的窗口。标准输出停在第 2 行已写出的那一行，进程以退出码 1 失败退出。
+
+### 字段名按 JSON 解码后比较：转义写法和排列顺序不改变结果
+
+JSON 允许把字段名写成 Unicode 转义。比较是否重复时，先把名字解码：`"key"` 与把字母 k 整个写成 Unicode 转义的 `"\u006bey"`（反斜杠、u、0、0、6、b，码位 U+006B 即小写 k）解码后是**同一个名字**，所以下面这条与上例同样在第 1 行失败：
+
+```bash
+printf '%s\n' \
+  '{"type":"event","key":"a","\u006bey":"b","time":100,"value":9}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+echo "exit=$?"
+```
+
+两个名字哪个写在前、与其他字段怎样交错排列都不影响结果；三个 `key` 与两个 `key` 同样失败。两个值**完全相同**也仍是重复，而不是"无害的重复书写"：
+
+```bash
+printf '%s\n' '{"type":"event","key":"same","key":"same","time":100,"value":1}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+# aggregate: line 1: field "key" appears more than once at the top level of an event record; remove the duplicate field
+# exit=1
+```
+
+对照：同样用 Unicode 转义，但把小写 k 换成**大写** K（`\u004bey`，U+004B），字段名解码为 `"Key"`，它与 `"key"` 是两个不同名字。记录因此只有一个 `key`，`"Key"` 按一贯的额外字段规则忽略，事件正常计数：
+
+```bash
+printf '%s\n' \
+  '{"type":"event","key":"a","\u004bey":"ignored","time":100,"value":9}' \
+  '{"type":"watermark","time":1000}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+# {"key":"a","start":0,"end":1000,"count":1,"sum":9}
+# exit=0
+```
+
+### 只检查事件的顶层：附加对象内部和字符串内容不算
+
+重复判断只数事件记录**自己的顶层成员**。附加对象（无论嵌在数组里、也无论出现在顶层 key 之前还是之后）内部出现名为 `key` 的成员都不算重复；字符串值里出现这几个字母同样不算。下面两条都以退出码 0 正常计数：
+
+```bash
+printf '%s\n' \
+  '{"type":"event","key":"a","time":100,"value":1,"extra":{"key":"b"}}' \
+  '{"type":"watermark","time":1000}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+
+printf '%s\n' \
+  '{"type":"event","key":"key","note":"mention the key field","time":100,"value":1}' \
+  '{"type":"watermark","time":1000}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+```
+
+额外字段继续按原规则忽略，因此 **watermark 和 idle 记录上附带的 `key`**（即使写两遍）也仍是额外字段，不触发这条校验：
+
+```bash
+printf '%s\n' \
+  '{"type":"event","key":"a","time":100,"value":1}' \
+  '{"type":"watermark","time":1000,"key":"x","key":"y"}' \
+  | /tmp/edgefleet aggregate --window-ms 1000
+# {"key":"a","start":0,"end":1000,"count":1,"sum":1}
+# exit=0
+```
+
+### 前一个 key 为空、类型错误或字符损坏，仍先报重复
+
+由于重复检查发生在任何字段**值**被解码之前，前一个值本身不合法、后一个值合法时，报告的仍是重复字段，而不是空 key、类型错误或字符损坏；`time`、`value`、`partition` 等其他字段同时有问题也一样。下面三种写法的失败原因完全相同，都是 `field "key" appears more than once ...`：
+
+```bash
+printf '%s\n' '{"type":"event","key":"","key":"b","time":100,"value":1}'        | /tmp/edgefleet aggregate --window-ms 1000
+printf '%s\n' '{"type":"event","key":7,"key":"b","time":100,"value":1}'         | /tmp/edgefleet aggregate --window-ms 1000
+printf '%s\n' '{"type":"event","key":"a\ud800b","key":"b","time":100,"value":1}' | /tmp/edgefleet aggregate --window-ms 1000
+```
+
+同理，在分区模式下来自**休眠分区**的重复 key 事件，报告的是重复字段，而不是"休眠分区事件"错误；它也不会被当作迟到跳过。格式本身不合法的 JSON 继续报告原有的格式错误（`invalid JSON record: ...`），不会因为文本里恰好出现两个 key 就改成重复原因，例如缺少右花括号的 `{"type":"event","key":"a","key":"b"` 仍是 `invalid JSON record: unexpected end of JSON input`。
+
+### 适用范围与未改变的行为
+
+这条规则对固定窗口、滑动窗口（`--slide-ms`）和分区聚合（`--partitions`，含分区＋滑动组合）接收的事件一视同仁；上面的命令行示例用单水位线固定窗口只是为了便于核对。只有一个顶层 key 的输入行为完全不变：合法的直接字符与等价 JSON 转义仍按解码后的字符串合并，输出中的 key 仍能还原原字符串；缺失、空字符串、类型错误与字符损坏仍按各自既有的原因失败；正常事件的窗口归属、聚合结果与输出次序均保持不变。
+
 ## 示例：累计求和的取值范围与即时溢出
 
 这一节专门说明同一个 key 在重叠窗口中的 `sum`：每条事件的值合法，并不等于把它加进每个窗口后的累计也合法。命令参数、逐行 JSON 输入格式、左闭右开的窗口划分和"只由水位线关闭、结束输入不补发"的规则都与前几节相同，这里只补充数值范围与失败时机。

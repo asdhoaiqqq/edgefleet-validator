@@ -201,7 +201,18 @@ type windowState struct {
 // problem: it is never repaired to U+FFFD and counted, so distinct damaged
 // keys can never merge or collide with a key that is genuinely U+FFFD. The
 // check runs before the late-event check, so a damaged key is fatal even
-// below the current watermark.
+// below the current watermark. A top-level "key" member repeated within one
+// event record is likewise fatal and is rejected even earlier, before any
+// field value is decoded: names are compared after JSON decoding, so a
+// Unicode-escape spelling of the same field name is a repeat, two identical
+// values are still a duplicate, and the textual order does not matter; a
+// "key" nested in an attached object or array value is not a top-level
+// member and stays ignored as before. The duplicate is therefore reported
+// even when the first key is empty, mistyped or damaged and the second is
+// legal, and even on an event that is late or bound for an idle partition --
+// it can never become a late notice or an idle-partition error. Malformed
+// JSON keeps its format error; a stray key on a watermark or idle record
+// stays an ignored extra field.
 //
 // A read failure is distinct from reaching the end of input. Only a reader
 // returning the bare io.EOF sentinel is a clean end, where a final record that
@@ -476,6 +487,12 @@ type aggregateState struct {
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
+	// Decode as the last-value-wins map first, reproducing exactly the format
+	// errors encoding/json has always given (including its non-object and
+	// trailing-data wording and its acceptance of null as an empty object).
+	// Event records additionally need the members in textual order, because a
+	// map silently keeps only the last value of a repeated name and would hide
+	// a duplicate key; that ordered scan happens on the event branch below.
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		return &InputError{Line: lineNo, Reason: "invalid JSON record: " + err.Error()}
@@ -492,7 +509,14 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 
 	switch recordType {
 	case "event":
-		return s.processEvent(obj, lineNo)
+		// A successful Unmarshal above means this ordered scan cannot hit a
+		// syntax error; handle the unexpected defensively with the same
+		// format-error wording anyway.
+		members, scanErr := objectMembers(line)
+		if scanErr != nil {
+			return &InputError{Line: lineNo, Reason: "invalid JSON record: " + scanErr.Error()}
+		}
+		return s.processEvent(members, lineNo)
 	case "watermark":
 		return s.processWatermark(obj, lineNo)
 	case "idle":
@@ -505,6 +529,90 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 	default:
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
 	}
+}
+
+// objectMember is one top-level object member in textual order: Name is the
+// JSON-decoded field name (so a literal "key" and a Unicode-escaped spelling
+// of the same letters share one Name), Raw its value token. Unlike a Go map,
+// a slice keeps every occurrence of a repeated name.
+type objectMember struct {
+	Name string
+	Raw  json.RawMessage
+}
+
+// objectMembers scans a complete JSON object value into its top-level members
+// in textual order. It exists because decoding into map[string]... silently
+// keeps only the last value of a repeated name, which would hide duplicate
+// fields; the caller has already parsed the same line with json.Unmarshal, so
+// the input is a well-formed JSON object (or null) without trailing data and
+// this scan cannot fail. Only top-level members are materialized: nested
+// objects and arrays are decoded as raw values, so a name inside one of them
+// never counts at the top level.
+func objectMembers(line string) ([]objectMember, error) {
+	dec := json.NewDecoder(strings.NewReader(line))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		// json.Unmarshal into the map only accepts, besides an object, a null
+		// value treated as an empty object; nothing else reaches here.
+		return nil, nil
+	}
+	var members []objectMember
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name := keyTok.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, err
+		}
+		members = append(members, objectMember{Name: name, Raw: raw})
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return nil, err
+	}
+	return members, nil
+}
+
+// membersAsMap projects ordered members onto the last-value-wins map the
+// record interpretation helpers read. Callers that need to reject repeated
+// names must have already checked the ordered slice, since the map cannot
+// distinguish a single member from a repeated one.
+func membersAsMap(members []objectMember) map[string]json.RawMessage {
+	obj := make(map[string]json.RawMessage, len(members))
+	for _, m := range members {
+		obj[m.Name] = m.Raw
+	}
+	return obj
+}
+
+// requireUniqueEventKey rejects an event record carrying the top-level member
+// name "key" more than once. Equality is on the JSON-decoded field name, so a
+// Unicode escape (for example U+006B for the letter k) that spells the same
+// name counts as a repeat, regardless of textual order or the two values --
+// two identical strings are still a duplicate. The check sees only top-level
+// members: a "key" nested in an attached object or array value does not
+// count, and neither do the letters inside a string value. It runs before any
+// field value is decoded, so an empty, mistyped or character-damaged first
+// key followed by a legal second one still reports the duplicate, and a
+// duplicate on a late or idle-partition event can never become a late notice
+// or an idle-partition error.
+func requireUniqueEventKey(members []objectMember, lineNo int) error {
+	seen := false
+	for _, m := range members {
+		if m.Name != "key" {
+			continue
+		}
+		if seen {
+			return &InputError{Line: lineNo, Reason: `field "key" appears more than once at the top level of an event record; remove the duplicate field`}
+		}
+		seen = true
+	}
+	return nil
 }
 
 // floorDiv returns math.Floor(a/b) for b > 0; Go's / truncates toward zero,
@@ -585,14 +693,23 @@ type eventRecord struct {
 
 // parseEventRecord is the interpretation half of event intake. It reads and
 // checks the record's own fields and never consults aggregate state, so field
-// legality is fully decided before any idle, late or window rule runs. Fields
-// are validated in the order they have always been rejected: key, then time,
-// then value, then partition. The key is decoded strictly: an empty key,
+// legality is fully decided before any idle, late or window rule runs. A
+// repeated top-level "key" member -- compared by the JSON-decoded field name,
+// so the literal spelling and a Unicode escape for the letter k (U+006B) are
+// the same name -- is rejected before any field value is inspected: the first
+// key being empty, mistyped or carrying damaged characters and the second
+// being legal is still a duplicate, never "use the last value". Afterwards
+// fields are validated in the order they have always been rejected: key, then
+// time, then value, then partition. The key is decoded strictly: an empty key,
 // invalid UTF-8 bytes and an unpaired or mispaired surrogate half are record
 // errors, never content repaired to U+FFFD that could merge keys. In legacy
 // mode (partitioned == false) extra fields -- including any stray partition
 // field -- stay ignored and partition is reported as zero.
-func parseEventRecord(obj map[string]json.RawMessage, partitioned bool, partitionCount int64, lineNo int) (eventRecord, error) {
+func parseEventRecord(members []objectMember, partitioned bool, partitionCount int64, lineNo int) (eventRecord, error) {
+	if err := requireUniqueEventKey(members, lineNo); err != nil {
+		return eventRecord{}, err
+	}
+	obj := membersAsMap(members)
 	key, err := requiredKey(obj, lineNo)
 	if err != nil {
 		return eventRecord{}, err
@@ -623,10 +740,10 @@ func parseEventRecord(obj map[string]json.RawMessage, partitioned bool, partitio
 	}, nil
 }
 
-func (s *aggregateState) processEvent(obj map[string]json.RawMessage, lineNo int) error {
+func (s *aggregateState) processEvent(members []objectMember, lineNo int) error {
 	// Stage 1: interpret and validate the record's own content without
 	// touching aggregate state.
-	ev, err := parseEventRecord(obj, s.partitions > 0, s.partitions, lineNo)
+	ev, err := parseEventRecord(members, s.partitions > 0, s.partitions, lineNo)
 	if err != nil {
 		return err
 	}
