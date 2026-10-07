@@ -387,7 +387,11 @@ func validateStoredRecords(records []Heartbeat) error {
 
 // writeNodeFile persists records atomically: a temp file in the same
 // directory is fsynced and renamed over the target, so a crash never leaves
-// a half-written file.
+// a half-written file. The directory holding the renamed file is then synced
+// as well, and a failure of that final confirmation (the directory cannot be
+// opened, or its sync to disk fails) is returned as an error of this save —
+// the batch must not be reported as persisted when the rename's durability
+// could not be confirmed.
 //
 // It is a package-level function variable rather than a plain func only so the
 // persist stage can be deterministically failed from tests that exercise a
@@ -435,10 +439,37 @@ func writeFileAtomic(path string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	// Best-effort fsync of the directory so the rename itself survives.
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
+	// The rename is only durable once the directory holding the file is
+	// itself synced to disk. A failure to open or sync that directory is a
+	// save failure of this batch, not a tolerable blip: the caller must not
+	// report the batch as persisted. The renamed file is left exactly where
+	// it is — the records it carries are genuinely saved and queryable, and
+	// deleting or reverting it would falsify the on-disk state. The error
+	// names the directory and the underlying reason.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("cannot confirm the saved file in directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// syncDir confirms a completed atomic rename by syncing the directory that
+// holds the renamed file, so the new file name itself survives a crash.
+// Both failure kinds are reported with their own reason: the directory
+// cannot be opened at all, or the sync to disk returns an error.
+//
+// It is a package-level function variable for the same reason writeNodeFile
+// is: tests exercise a real mid-batch directory-confirmation failure (the
+// node file already renamed into place, the confirmation failing right
+// after) by deterministically failing this step; production code always
+// invokes the default implementation below and never reassigns it.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("cannot open directory: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("cannot sync directory to disk: %w", err)
 	}
 	return nil
 }
