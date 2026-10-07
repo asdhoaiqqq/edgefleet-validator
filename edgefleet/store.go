@@ -307,76 +307,68 @@ func loadNodeFile(loc nodeLocation) (*nodeFile, error) {
 	return nf, nil
 }
 
+// envelopeFields enumerates the node-file envelope's required fields in the
+// order their presence is checked.
+var envelopeFields = []string{"format", "checksum", "records"}
+
 // decodeStrictNodeFile parses the on-disk envelope without letting
 // encoding/json defaults hide missing or duplicated data. The envelope has
 // exactly three keys — format, checksum, records — each present, non-null and
-// written once; the uniqueness judgement is the shared objectFields rule, so
-// a Unicode-escaped spelling of the same key collides exactly as it does in a
-// submitted heartbeat object. Every element of records is decoded with
+// written once; the object walk itself (framing, field-name decoding, the
+// uniqueness rule) is the shared walkStrictObject, so a Unicode-escaped
+// spelling of the same key collides exactly as it does in a submitted
+// heartbeat object. Every element of records is decoded with
 // decodeStrictHeartbeatObject, so a missing, null or duplicated telemetry
 // field is an error naming the record and field rather than a zero value.
 // Whitespace and key ordering carry no meaning and never cause a failure.
 func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("invalid JSON: file must be a JSON object")
-	}
 
 	var (
 		format   string
 		checksum string
 		records  []json.RawMessage
 	)
-	fields := objectFields{}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil, fmt.Errorf("invalid JSON: %w", err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil, fmt.Errorf("invalid JSON: envelope field name must be a string")
-		}
-		var val json.RawMessage
-		if err := dec.Decode(&val); err != nil {
-			return nil, fmt.Errorf("invalid value for envelope field %q: %w", key, err)
-		}
-		if fields.check(key) {
-			return nil, fmt.Errorf("duplicate envelope field %q", key)
-		}
+	// This boundary decodes and checks each value inline, in document order:
+	// a repeated name is caught only after its value has been read, and an
+	// unknown name is rejected where it appears rather than after the walk.
+	// The submit-record boundary makes the opposite choices; each keeps its
+	// own ordering through the walk spec.
+	handle := func(key string, val json.RawMessage) error {
 		switch key {
 		case "format":
-			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			if isNullJSON(val) {
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &format); err != nil {
-				return nil, fmt.Errorf("format must be a string: %w", err)
+				return fmt.Errorf("format must be a string: %w", err)
 			}
 		case "checksum":
-			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			if isNullJSON(val) {
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &checksum); err != nil {
-				return nil, fmt.Errorf("checksum must be a string: %w", err)
+				return fmt.Errorf("checksum must be a string: %w", err)
 			}
 		case "records":
-			if bytes.Equal(val, []byte("null")) {
-				return nil, fmt.Errorf("envelope field %q must not be null", key)
+			if isNullJSON(val) {
+				return fmt.Errorf("envelope field %q must not be null", key)
 			}
 			if err := json.Unmarshal(val, &records); err != nil {
-				return nil, fmt.Errorf("records must be an array of heartbeat objects: %w", err)
+				return fmt.Errorf("records must be an array of heartbeat objects: %w", err)
 			}
 		default:
-			return nil, fmt.Errorf("unknown envelope field %q", key)
+			return fmt.Errorf("unknown envelope field %q", key)
 		}
+		return nil
 	}
-	// Consume the closing brace.
-	if _, err := dec.Token(); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
+	fields, err := walkStrictObject(dec, strictObjectWalk{
+		render:         (*objectWalkError).envelopeError,
+		dupBeforeValue: false,
+		handle:         handle,
+	})
+	if err != nil {
+		return nil, err
 	}
 	// Nothing may follow the single envelope object.
 	if _, err := dec.Token(); err != io.EOF {
@@ -386,14 +378,10 @@ func decodeStrictNodeFile(data []byte) (*nodeFile, error) {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	if !fields.has("format") {
-		return nil, fmt.Errorf("missing required envelope field %q", "format")
-	}
-	if !fields.has("checksum") {
-		return nil, fmt.Errorf("missing required envelope field %q", "checksum")
-	}
-	if !fields.has("records") {
-		return nil, fmt.Errorf("missing required envelope field %q", "records")
+	if err := fields.requireEach(envelopeFields, func(f string) error {
+		return fmt.Errorf("missing required envelope field %q", f)
+	}); err != nil {
+		return nil, err
 	}
 
 	nf := &nodeFile{Format: format, Checksum: checksum, Records: make([]Heartbeat, 0, len(records))}

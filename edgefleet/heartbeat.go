@@ -470,42 +470,10 @@ func ParseHeartbeats(data []byte, receiveTime time.Time) ([]Heartbeat, error) {
 // A null value means the node did not report the field, which must not be
 // silently saved as the zero value.
 func rejectNull(raw json.RawMessage, field string) error {
-	if bytes.Equal(raw, []byte("null")) {
+	if isNullJSON(raw) {
 		return fmt.Errorf("%s must not be null", field)
 	}
 	return nil
-}
-
-// objectFields collects the fields of one JSON object while enforcing the
-// single field-uniqueness rule shared by every strict decoder in this
-// package: within one object, a field name may appear only once. Names are
-// compared as the JSON strings they decode to, so a plain spelling and a
-// Unicode-escaped spelling of the same name collide, whether the repeated
-// value is identical or different. The rule is scoped to the current object:
-// the same field name appearing in another heartbeat object is unrelated.
-// Both the submit-input decoder (decodeStrictHeartbeatObject) and the
-// stored-file envelope decoder (decodeStrictNodeFile) apply the rule through
-// this type; each boundary keeps its own error wording and its own check
-// ordering for the rejection.
-//
-// A nil map value means the name has been seen but its value not decoded
-// yet; once decoded, the value is stored under the name.
-type objectFields map[string]json.RawMessage
-
-// check records one occurrence of a field name and reports whether the name
-// already appeared in this object (duplicate == true).
-func (o objectFields) check(name string) (duplicate bool) {
-	if _, exists := o[name]; exists {
-		return true
-	}
-	o[name] = nil
-	return false
-}
-
-// has reports whether the field name appeared in this object.
-func (o objectFields) has(name string) bool {
-	_, exists := o[name]
-	return exists
 }
 
 // decodeStrictHeartbeatObject converts one JSON object's raw bytes into a
@@ -513,57 +481,33 @@ func (o objectFields) has(name string) bool {
 // fields must be present and non-null, unknown fields are rejected, and a
 // field may never appear twice in the same object — even with the same
 // value, and even when one spelling uses a JSON Unicode escape denoting the
-// same key (the shared objectFields rule). A plain struct/map unmarshal
-// would instead keep the last
-// occurrence and let an absent field masquerade as the zero value. Both the
-// submit input path and the stored-file read path must use it.
+// same key. The object walk itself (framing, field-name decoding, the
+// uniqueness rule) is the shared walkStrictObject; a plain struct/map
+// unmarshal would instead keep only the last occurrence and let an absent
+// field masquerade as the zero value. Both the submit input path and the
+// stored-file read path must use it.
 func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
-	// Walk the object with a streaming decoder so duplicate field names are
-	// detected. Field names are compared as the JSON string they represent:
-	// "missed" and "m\u0069ssed" are the same field. A map-based unmarshal
-	// would silently keep only the last occurrence.
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	tok, err := dec.Token()
+	// This boundary rejects a repeated field name before its value is read
+	// and decodes each collected value only after the whole object has been
+	// walked; the envelope boundary makes the opposite choices, and each
+	// keeps its own ordering through the walk spec.
+	fields, err := walkStrictObject(json.NewDecoder(bytes.NewReader(raw)), strictObjectWalk{
+		render:         (*objectWalkError).heartbeatError,
+		dupBeforeValue: true,
+	})
 	if err != nil {
-		return Heartbeat{}, fmt.Errorf("record must be a JSON object: %w", err)
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return Heartbeat{}, fmt.Errorf("record must be a JSON object")
+		return Heartbeat{}, err
 	}
 
-	fields := objectFields{}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return Heartbeat{}, fmt.Errorf("invalid field: %w", err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return Heartbeat{}, fmt.Errorf("field name must be a string")
-		}
-		if fields.check(key) {
-			return Heartbeat{}, fmt.Errorf("duplicate field %q", key)
-		}
-		var val json.RawMessage
-		if err := dec.Decode(&val); err != nil {
-			return Heartbeat{}, fmt.Errorf("invalid value for field %q: %w", key, err)
-		}
-		fields[key] = val
+	if err := fields.requireEach(heartbeatFields, func(f string) error {
+		return fmt.Errorf("missing required field %q", f)
+	}); err != nil {
+		return Heartbeat{}, err
 	}
-	// Consume the closing brace.
-	if _, err := dec.Token(); err != nil {
-		return Heartbeat{}, fmt.Errorf("invalid record: %w", err)
-	}
-
-	for _, f := range heartbeatFields {
-		if !fields.has(f) {
-			return Heartbeat{}, fmt.Errorf("missing required field %q", f)
-		}
-	}
-	for k := range fields {
-		if !containsString(heartbeatFields, k) {
-			return Heartbeat{}, fmt.Errorf("unknown field %q", k)
-		}
+	if err := fields.rejectUnknown(heartbeatFields, func(k string) error {
+		return fmt.Errorf("unknown field %q", k)
+	}); err != nil {
+		return Heartbeat{}, err
 	}
 
 	var h Heartbeat
@@ -755,13 +699,4 @@ func parseOneHeartbeat(raw json.RawMessage, receiveTime time.Time) (Heartbeat, e
 		return Heartbeat{}, err
 	}
 	return h, nil
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
