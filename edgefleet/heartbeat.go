@@ -234,8 +234,8 @@ func twoDecimalDigits(s string) (int, bool) {
 // truncates a fractional second beyond nine digits — with either of the
 // decimal separators it accepts, "." and "," — so ".1234567891" and
 // ".1234567892", and likewise ",1234567891" and ",1234567892", both decode
-// to the same nanosecond instant even though the node reported two different
-// moments. Heartbeat collection times must be preserved exactly, so such
+// to the same nanosecond instant even though they name two different
+// moments. A time used for a health query must be preserved exactly, so such
 // input is refused under the same rule no matter which separator was written,
 // never truncated or rounded. A fraction of at most nine digits always parses
 // exactly, and a longer fraction is accepted only when every digit past the
@@ -404,6 +404,50 @@ func ValidateHeartbeat(h Heartbeat, receiveTime time.Time) error {
 		return e.directError()
 	}
 	return checkCollectedAtTiming(h.CollectedAt, receiveTime)
+}
+
+// ParseQueryTime parses the explicit query instant of a `heartbeat health`
+// --at flag under the same textual limits as a heartbeat collection time. It
+// exists because the query instant drives the exact 60-second online edge:
+// time.Parse(RFC3339) folds an out-of-range numeric offset (+00:60 -> +01:00)
+// and accepts +24:00/-24:00, and it silently truncates a fractional second
+// beyond nine digits (for both "." and "," separators). Accepting either gap
+// would let a query the user never named — or one that cannot be represented
+// exactly — decide node status: a query written 60s plus a sub-nanosecond
+// overshoot would be judged as exactly 60s and reported online.
+//
+// The value must therefore carry a timezone: "Z" or a numeric ±HH:MM offset
+// whose own hour field is 00..23 and minute field 00..59 with no carry-over
+// (Z, -00:00 and ±23:59 are legal boundaries), and a fractional second of at
+// most nine digits, or more digits only when every digit past the ninth is
+// zero — never truncated or rounded. These are exactly the text rules
+// validateCollectedAtText and validateCollectedAtFraction enforce for
+// collected_at; the collected_at instant-level rules do not apply to a query
+// instant (it is never persisted), and time.Parse already bounds the year to
+// the four-digit RFC3339 range. An empty value is rejected here; the command
+// boundary substitutes the current time only when --at is omitted and never
+// reaches this function with an empty string.
+func ParseQueryTime(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, fmt.Errorf("--at must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00Z)")
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("--at %q must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00Z): %v", value, err)
+	}
+	// time.Parse folds out-of-range numeric offsets (+00:60 -> +01:00) and
+	// accepts ±24:00; verify the written offset before trusting the fold, just
+	// as decodeStrictHeartbeatObject does for collected_at.
+	if err := validateCollectedAtText(value); err != nil {
+		return time.Time{}, fmt.Errorf("--at %q: %w", value, err)
+	}
+	// time.Parse also silently truncates a fractional second beyond nine
+	// digits for both accepted separators ("." and ","); the query moment must
+	// be exactly representable before node status is judged from it.
+	if err := validateCollectedAtFraction(value); err != nil {
+		return time.Time{}, fmt.Errorf("--at %q: %w", value, err)
+	}
+	return t, nil
 }
 
 // Equal reports whether two records are the same telemetry. Collection times

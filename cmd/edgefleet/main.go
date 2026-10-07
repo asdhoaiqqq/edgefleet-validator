@@ -134,7 +134,14 @@ func heartbeatUsage() {
 	fmt.Println("           --tolerated-misses N  tolerated missed duties, >= 0 (required)")
 	fmt.Println("           --missed-since-seq S  seq of a saved heartbeat used as the")
 	fmt.Println("                                missed-duty baseline (optional, > 0)")
-	fmt.Println("           --at TIME             query time, RFC3339 (default: now)")
+	fmt.Println("           --at TIME             query time, RFC3339 with timezone")
+	fmt.Println("                                (default: now); like collected_at,")
+	fmt.Println("                                numeric offset hour 00-23 and minute")
+	fmt.Println("                                00-59 (+24:00 and +00:60 are rejected,")
+	fmt.Println("                                not folded), and a fractional second")
+	fmt.Println("                                (. or ,) past nine digits is accepted")
+	fmt.Println("                                only when every later digit is zero,")
+	fmt.Println("                                never truncated or rounded")
 	fmt.Println("           --data-dir DIR        data directory")
 	fmt.Println()
 	fmt.Println("  Without --missed-since-seq the missed-duty alarm uses the cumulative")
@@ -236,7 +243,22 @@ func cmdHealth(args []string) {
 		die("--missed-since-seq must be a positive integer")
 	}
 
-	at := parseTimeFlag(*atStr, "--at")
+	// Parse the query instant before touching the store: a malformed --at must
+	// fail the query whether or not the node has telemetry and whether or not a
+	// missed-since baseline was given. An omitted --at keeps meaning "now"; an
+	// explicit value is parsed with the same offset/fraction limits as a
+	// heartbeat collection time, so a folded offset or truncated sub-nanosecond
+	// fraction can never decide node status.
+	var at time.Time
+	if *atStr == "" {
+		at = time.Now()
+	} else {
+		parsed, err := edgefleet.ParseQueryTime(*atStr)
+		if err != nil {
+			die("%v", err)
+		}
+		at = parsed
+	}
 
 	store, err := edgefleet.OpenStore(*dataDir)
 	if err != nil {
