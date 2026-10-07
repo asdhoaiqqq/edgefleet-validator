@@ -720,52 +720,127 @@ func (s *aggregateState) addEventToWindow(ev eventRecord, start int64, lineNo in
 	return nil
 }
 
-func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo int) error {
+// watermarkRecord is one input watermark whose record content has already been
+// interpreted and validated independently of aggregate state: time and (in
+// partitioned mode) partition are final. Nothing about a previous watermark,
+// the effective minimum or an idle partition has been inspected yet, so
+// producing one never mutates -- or even reads -- window or watermark state.
+type watermarkRecord struct {
+	time      int64
+	partition int64 // partitioned mode only; always 0 in legacy mode
+}
+
+// parseWatermarkRecord is the interpretation half of watermark intake. It
+// reads and checks the record's own fields and never consults aggregate
+// state, so field legality is fully decided before any single-watermark,
+// backwards or idle-resume rule runs. Fields are validated in the order they
+// have always been rejected, independent of their textual order in the JSON:
+// time first, then partition. Time must be a non-negative signed 64-bit
+// integer. In partitioned mode partition must be present and in
+// [0,partitionCount); when both fields are bad the time problem is the one
+// reported. In legacy mode (partitioned == false) extra fields -- including
+// any stray partition field, whatever its value -- stay ignored and never
+// reject the record; partition is reported as zero.
+func parseWatermarkRecord(obj map[string]json.RawMessage, partitioned bool, partitionCount int64, lineNo int) (watermarkRecord, error) {
 	next, err := requiredNonNegInt64(obj, "time", lineNo)
 	if err != nil {
-		return err
+		return watermarkRecord{}, err
 	}
-	p, err := s.requiredPartition(obj, lineNo)
+	var partition int64
+	if partitioned {
+		partition, err = requiredPartitionField(obj, partitionCount, lineNo)
+		if err != nil {
+			return watermarkRecord{}, err
+		}
+	}
+	return watermarkRecord{time: next, partition: partition}, nil
+}
+
+func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo int) error {
+	// Stage 1: interpret and validate the record's own content without
+	// touching aggregate state.
+	wm, err := parseWatermarkRecord(obj, s.partitions > 0, s.partitions, lineNo)
 	if err != nil {
 		return err
 	}
+	// Stage 2: decide whether the validated watermark may change state and,
+	// only once it may, record it and close windows.
+	return s.acceptWatermark(wm, lineNo)
+}
 
+// acceptWatermark is the state half of watermark intake: it applies one record
+// that parseWatermarkRecord has already fully validated. It never re-reads or
+// re-validates record fields, so a field problem can never be downgraded to a
+// backwards-watermark or resume failure here, and a rejected record returns
+// before any state changes: the partition is not resumed early, no watermark
+// advances and no window output is triggered. A legal watermark may repeat or
+// jump forward; the single legacy watermark and each active partition's own
+// watermark still never move backwards. An accepted watermark funnels through
+// the same advance-and-close path as an idle declaration.
+func (s *aggregateState) acceptWatermark(wm watermarkRecord, lineNo int) error {
 	if s.partitions == 0 {
-		if s.watermark != nil && next < *s.watermark {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, next)}
+		if s.watermark != nil && wm.time < *s.watermark {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, wm.time)}
 		}
-		s.watermark = &next
-	} else {
-		resuming := s.idle[p]
-		if resuming {
-			// A resume watermark must be at least the partition's previous
-			// watermark and the effective watermark produced while it was
-			// idle; equality on either boundary resumes.
-			if prev, ok := s.partWatermark[p]; ok && next < *prev {
-				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below its previous watermark %d", next, p, *prev)}
-			}
-			if s.watermark != nil && next < *s.watermark {
-				return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below the current effective watermark %d", next, p, *s.watermark)}
-			}
-			delete(s.idle, p)
-		} else if prev, ok := s.partWatermark[p]; ok && next < *prev {
-			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
-		}
-		if _, reported := s.partWatermark[p]; !reported && !resuming {
-			// First report from an active partition: one fewer partition the
-			// effective watermark still waits for. A resume reports too, but
-			// a never-reported partition was already subtracted when it was
-			// declared idle, so the count needs no change on this path. A
-			// rejected (backwards) watermark returns above and never reaches
-			// this decrement.
-			s.unreportedActive--
-		}
-		s.partWatermark[p] = &next
+		s.watermark = &wm.time
+		return s.advanceWatermark(lineNo)
 	}
-
-	// A watermark update and an idle declaration share one advance-and-close
-	// path from here so both triggers follow the same rules.
+	if err := s.checkPartitionWatermark(wm, lineNo); err != nil {
+		return err
+	}
+	s.applyPartitionWatermark(wm)
 	return s.advanceWatermark(lineNo)
+}
+
+// checkPartitionWatermark decides, without mutating anything, whether one
+// record-valid partitioned-mode watermark may change aggregate state, and
+// returns the existing *InputError when it may not. Two situations are kept
+// apart:
+//
+//   - The partition is active: its watermark may repeat or jump forward but
+//     never move backwards relative to its own previous value.
+//   - The partition is idle: the record resumes it, and its time must be at
+//     least both the partition's own previous watermark and the current
+//     effective (minimum) watermark; equality on either boundary resumes. When
+//     both lower bounds are violated the partition's own previous watermark is
+//     the one reported, checked first. A partition that idled before ever
+//     reporting has no previous watermark, so only the effective bound
+//     applies.
+func (s *aggregateState) checkPartitionWatermark(wm watermarkRecord, lineNo int) error {
+	p, next := wm.partition, wm.time
+	if s.idle[p] {
+		if prev, ok := s.partWatermark[p]; ok && next < *prev {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below its previous watermark %d", next, p, *prev)}
+		}
+		if s.watermark != nil && next < *s.watermark {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf("resume watermark %d for partition %d is below the current effective watermark %d", next, p, *s.watermark)}
+		}
+		return nil
+	}
+	if prev, ok := s.partWatermark[p]; ok && next < *prev {
+		return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark for partition %d moved backwards from %d to %d", p, *prev, next)}
+	}
+	return nil
+}
+
+// applyPartitionWatermark records one partition watermark that
+// checkPartitionWatermark has already accepted, keeping the bookkeeping apart
+// from the decision: a resume removes the partition from the idle set, and the
+// first report from an active partition decrements the count of partitions
+// the effective watermark still waits for. A resume of a never-reported
+// partition changes no counter -- that partition was already subtracted when
+// it was declared idle -- and only after that is the partition's watermark
+// value replaced.
+func (s *aggregateState) applyPartitionWatermark(wm watermarkRecord) {
+	p, next := wm.partition, wm.time
+	resuming := s.idle[p]
+	if resuming {
+		delete(s.idle, p)
+	}
+	if _, reported := s.partWatermark[p]; !reported && !resuming {
+		s.unreportedActive--
+	}
+	s.partWatermark[p] = &next
 }
 
 // processIdle declares a partition idle: it stops contributing to the
