@@ -42,6 +42,46 @@ func IsCorrupt(err error) bool {
 	return errors.As(err, &ce)
 }
 
+// SaveConfirmError means a node file's new content was written and atomically
+// renamed into place, but the replacement could not be confirmed as a completed
+// save: the file's directory could not be opened, or syncing that directory to
+// disk returned an error. Both confirmations run in the save stage, after the
+// rename, so this is a save failure even though the new file is already
+// reachable — never a heartbeat content conflict, an illegal field, or stored
+// data corruption: the file on disk is complete and well-formed, and it is left
+// exactly as it landed (records already saved stay queryable; nothing is rolled
+// back or deleted). A caller reports the batch as failed with zero new and zero
+// duplicate counts, and the same batch can be resubmitted verbatim once the
+// storage condition clears.
+//
+// Dir is the directory whose durability confirmation failed (nodes/ for a
+// short node id, slots/ for a long one), and Op is the confirmation step that
+// failed ("open" or "sync").
+type SaveConfirmError struct {
+	Dir string
+	Op  string
+	Err error
+}
+
+func (e *SaveConfirmError) Error() string {
+	switch e.Op {
+	case "open":
+		return fmt.Sprintf("save confirmation failed in directory %s: cannot open directory to confirm node-file replacement: %v", e.Dir, e.Err)
+	case "sync":
+		return fmt.Sprintf("save confirmation failed in directory %s: cannot sync directory to disk after node-file replacement: %v", e.Dir, e.Err)
+	default:
+		return fmt.Sprintf("save confirmation failed in directory %s: %v", e.Dir, e.Err)
+	}
+}
+
+func (e *SaveConfirmError) Unwrap() error { return e.Err }
+
+// IsSaveConfirm reports whether err is (or wraps) a SaveConfirmError.
+func IsSaveConfirm(err error) bool {
+	var se *SaveConfirmError
+	return errors.As(err, &se)
+}
+
 // nodeFile is the on-disk layout for one node.
 type nodeFile struct {
 	Format   string      `json:"format"`
@@ -387,7 +427,10 @@ func validateStoredRecords(records []Heartbeat) error {
 
 // writeNodeFile persists records atomically: a temp file in the same
 // directory is fsynced and renamed over the target, so a crash never leaves
-// a half-written file.
+// a half-written file, and the containing directory is then opened and
+// fsynced so the replacement itself is durable. A failure of that final
+// directory confirmation (after the rename) is returned as *SaveConfirmError
+// with the replaced file left intact.
 //
 // It is a package-level function variable rather than a plain func only so the
 // persist stage can be deterministically failed from tests that exercise a
@@ -435,10 +478,36 @@ func writeFileAtomic(path string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	// Best-effort fsync of the directory so the rename itself survives.
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
+	// The replacement is reachable but not yet confirmed durable: sync the
+	// containing directory. This is part of the save, and its failure is a save
+	// failure (see syncDirectoryDurably/SaveConfirmError); the renamed file is
+	// left intact either way.
+	return syncDirectoryDurably(dir)
+}
+
+// syncDirectoryDurably opens dir and fsyncs it, confirming that a node file
+// renamed into dir is durable. Both steps belong to the save stage: the
+// directory may be unopenable (permissions, a dropped mount) or its fsync may
+// return an I/O error, and either result means the replacement was not
+// confirmed — although the rename already happened and the complete new file
+// is reachable by name. Such a failure is therefore returned as
+// *SaveConfirmError, never as corruption or a content error; the file on disk
+// is well-formed and must not be rolled back.
+//
+// It is a package-level function variable for the same reason writeNodeFile
+// is: the directory-sync step can be deterministically failed from tests that
+// exercise a real, post-rename confirmation failure (the replacement already
+// on disk when sync is refused). Production code always invokes the default
+// implementation below and never reassigns it.
+var syncDirectoryDurably = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return &SaveConfirmError{Dir: dir, Op: "open", Err: err}
+	}
+	syncErr := d.Sync()
+	d.Close()
+	if syncErr != nil {
+		return &SaveConfirmError{Dir: dir, Op: "sync", Err: syncErr}
 	}
 	return nil
 }
@@ -548,7 +617,11 @@ func (s *Store) Submit(records []Heartbeat, receiveTime time.Time) (newCount, du
 	}
 
 	// Persist. All updates are appends to previously verified data, so a
-	// failure here leaves every previously queryable record intact.
+	// failure here leaves every previously queryable record intact. A failure
+	// can land after one node file's rename: the write itself completed but the
+	// directory durability confirmation (open/fsync) failed; that is still a
+	// save failure (SaveConfirmError) reported with zero counts, and the
+	// complete renamed file is left in place rather than rolled back.
 	for _, u := range updates {
 		if err := writeNodeFile(u.loc.path, u.records); err != nil {
 			return 0, 0, fmt.Errorf("failed to persist heartbeat batch: %w", err)
