@@ -203,6 +203,24 @@ type windowState struct {
 // check runs before the late-event check, so a damaged key is fatal even
 // below the current watermark.
 //
+// An event record may name its top-level field "key" at most once. The field
+// is judged after JSON decoding, so writing key directly and writing it with
+// an escape for the letter k (backslash-u-006b followed by ey, which decodes
+// to key) are two spellings of the same field and a record carrying both is a
+// duplicate; member order and equal values do not change that, and a "key"
+// nested inside another member's object or array is not counted. Once the
+// line has parsed as one complete JSON object and its type is event, the
+// duplicate is fatal and is rejected before the key, time, value or
+// partition fields are interpreted and before partition and watermark state
+// is consulted: an empty or damaged earlier key, an event below the current
+// watermark or an event for an idle partition is still reported as the
+// duplicate rather than as a field error, a late notice or an idle-partition
+// error. The event contributes no count or sum, no later record is read, and
+// results already fully written to out stay written. A watermark or idle
+// record that happens to carry a key keeps treating it as an ignored extra
+// field. Lines that are not one complete JSON object keep their original
+// invalid-JSON error instead.
+//
 // A read failure is distinct from reaching the end of input. Only a reader
 // returning the bare io.EOF sentinel is a clean end, where a final record that
 // arrived without a trailing newline is still processed (and a damaged one is
@@ -476,8 +494,11 @@ type aggregateState struct {
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(line), &obj); err != nil {
+	// Parse with a streaming token decoder rather than into a map: a map
+	// silently keeps the last value of a repeated member name, while the
+	// scan additionally counts how many top-level members decode to "key".
+	obj, keyCount, err := scanAggregateObject(line)
+	if err != nil {
 		return &InputError{Line: lineNo, Reason: "invalid JSON record: " + err.Error()}
 	}
 
@@ -492,6 +513,14 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 
 	switch recordType {
 	case "event":
+		// Once the JSON is complete and recognized as an event, a repeated
+		// top-level key is rejected before any event field is read or
+		// decoded: an empty or damaged earlier value or a legal later one
+		// never becomes a field error, a late-event notice or an
+		// idle-partition error.
+		if keyCount > 1 {
+			return &InputError{Line: lineNo, Reason: duplicateEventKeyReason}
+		}
 		return s.processEvent(obj, lineNo)
 	case "watermark":
 		return s.processWatermark(obj, lineNo)
@@ -505,6 +534,77 @@ func (s *aggregateState) processLine(line string, lineNo int) error {
 	default:
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("unknown record type %q", recordType)}
 	}
+}
+
+// duplicateEventKeyReason is the record error for a complete event whose JSON
+// object names the top-level field "key" more than once.
+const duplicateEventKeyReason = `duplicate field "key": an event record must name "key" at most once at its top level`
+
+// scanAggregateObject parses one complete JSON object record the way the
+// aggregate entries read it and additionally reports how many of the object's
+// own members decode to the field name "key". Members are counted in JSON
+// source order with their decoded names, so a member written "key" and one
+// whose quoted name escapes the letter k (backslash-u-006b-ey, which JSON
+// decodes to key) are the same field and both count, while a "key" nested
+// inside another member's object or array is not top-level and is skipped
+// wholesale by decoding that value. A non-object, malformed JSON or trailing
+// data is rejected, and the reported error is re-derived from the existing
+// json.Unmarshal-into-a-map parse so such input keeps its original invalid
+// JSON wording; the duplicate-key rule therefore applies only to a record
+// that parsed as one complete object. The returned map is exactly what that
+// unmarshal produced (a repeated member keeps its last value); the count is
+// what lets callers reject the repetition instead of silently using it.
+func scanAggregateObject(line string) (map[string]json.RawMessage, int, error) {
+	dec := json.NewDecoder(strings.NewReader(line))
+	first, err := dec.Token()
+	if err != nil {
+		return nil, 0, invalidAggregateJSON(line)
+	}
+	delim, ok := first.(json.Delim)
+	if !ok || delim != '{' {
+		// Route every non-object opening through the legacy map parse, which
+		// decides its exact error wording -- and, for JSON null, no error at
+		// all: a null unmarshals into a nil map, so the caller reaches the
+		// missing-type report exactly as it did before the streaming scan.
+		return nil, 0, invalidAggregateJSON(line)
+	}
+	obj := make(map[string]json.RawMessage)
+	keyCount := 0
+	for dec.More() {
+		nameToken, err := dec.Token()
+		if err != nil {
+			return nil, 0, invalidAggregateJSON(line)
+		}
+		name := nameToken.(string) // between { and }, object member names are JSON strings
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, 0, invalidAggregateJSON(line)
+		}
+		obj[name] = raw
+		if name == "key" {
+			keyCount++
+		}
+	}
+	if _, err := dec.Token(); err != nil { // the closing '}'
+		return nil, 0, invalidAggregateJSON(line)
+	}
+	// One complete object only: trailing JSON (unlike trailing whitespace) is
+	// malformed, as it was for json.Unmarshal.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, 0, invalidAggregateJSON(line)
+	}
+	return obj, keyCount, nil
+}
+
+// invalidAggregateJSON re-runs the pre-existing map parse for a line the
+// streaming object scan rejected as not one complete object, so malformed
+// JSON keeps its original reason text exactly. It returns nil for JSON null,
+// which unmarshals into a nil map without error; the caller treats that like
+// any object with no "type" member and reports the missing type, preserving
+// the old behavior for null.
+func invalidAggregateJSON(line string) error {
+	var obj map[string]json.RawMessage
+	return json.Unmarshal([]byte(line), &obj)
 }
 
 // floorDiv returns math.Floor(a/b) for b > 0; Go's / truncates toward zero,
@@ -585,12 +685,14 @@ type eventRecord struct {
 
 // parseEventRecord is the interpretation half of event intake. It reads and
 // checks the record's own fields and never consults aggregate state, so field
-// legality is fully decided before any idle, late or window rule runs. Fields
-// are validated in the order they have always been rejected: key, then time,
-// then value, then partition. The key is decoded strictly: an empty key,
-// invalid UTF-8 bytes and an unpaired or mispaired surrogate half are record
-// errors, never content repaired to U+FFFD that could merge keys. In legacy
-// mode (partitioned == false) extra fields -- including any stray partition
+// legality is fully decided before any idle, late or window rule runs. A
+// repeated top-level "key" never reaches here: processLine rejects it before
+// this call, so the fields are read exactly once each. Fields are validated
+// in the order they have always been rejected: key, then time, then value,
+// then partition. The key is decoded strictly: an empty key, invalid UTF-8
+// bytes and an unpaired or mispaired surrogate half are record errors, never
+// content repaired to U+FFFD that could merge keys. In legacy mode
+// (partitioned == false) extra fields -- including any stray partition
 // field -- stay ignored and partition is reported as zero.
 func parseEventRecord(obj map[string]json.RawMessage, partitioned bool, partitionCount int64, lineNo int) (eventRecord, error) {
 	key, err := requiredKey(obj, lineNo)
