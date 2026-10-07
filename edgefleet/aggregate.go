@@ -720,22 +720,74 @@ func (s *aggregateState) addEventToWindow(ev eventRecord, start int64, lineNo in
 	return nil
 }
 
-func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo int) error {
+// watermarkRecord is one input watermark whose record content has already
+// been interpreted and validated independently of aggregate state: time and
+// (in partitioned mode) partition are final. Nothing about current
+// watermarks, idle partitions or windows has been inspected yet, so
+// producing one never mutates -- or even reads -- aggregate state.
+type watermarkRecord struct {
+	time      int64
+	partition int64 // partitioned mode only; always 0 in legacy mode
+}
+
+// parseWatermarkRecord is the interpretation half of watermark intake. It
+// reads and checks the record's own fields and never consults aggregate
+// state, so field legality is fully decided before any backwards-movement or
+// idle-resume rule runs. Fields are validated in the order they have always
+// been rejected: time first -- a non-negative signed 64-bit integer -- then,
+// in partitioned mode only, partition range-checked against the configured
+// count. Both checks are pure record content judgements, so when both fields
+// are broken the time problem is reported regardless of the fields' textual
+// order in the JSON. In legacy mode (partitioned == false) extra fields --
+// including any stray partition field -- stay ignored and partition is
+// reported as zero.
+func parseWatermarkRecord(obj map[string]json.RawMessage, partitioned bool, partitionCount int64, lineNo int) (watermarkRecord, error) {
 	next, err := requiredNonNegInt64(obj, "time", lineNo)
 	if err != nil {
-		return err
+		return watermarkRecord{}, err
 	}
-	p, err := s.requiredPartition(obj, lineNo)
+	var partition int64
+	if partitioned {
+		partition, err = requiredPartitionField(obj, partitionCount, lineNo)
+		if err != nil {
+			return watermarkRecord{}, err
+		}
+	}
+	return watermarkRecord{time: next, partition: partition}, nil
+}
+
+func (s *aggregateState) processWatermark(obj map[string]json.RawMessage, lineNo int) error {
+	// Stage 1: interpret and validate the record's own content without
+	// touching aggregate state.
+	wm, err := parseWatermarkRecord(obj, s.partitions > 0, s.partitions, lineNo)
 	if err != nil {
 		return err
 	}
+	// Stage 2: apply the validated watermark to aggregate state.
+	return s.acceptWatermark(wm, lineNo)
+}
 
+// acceptWatermark is the state half of watermark intake: it decides whether
+// one record that parseWatermarkRecord has already fully validated may
+// change the current watermark state, and applies it. It never re-reads or
+// re-validates record fields, so a field problem can never be downgraded to
+// a backwards-movement or resume failure here, and a rejected watermark
+// changes no state: no partition resumes early and no window closes. A
+// watermark may repeat or jump forward but never move backwards -- in legacy
+// mode against the single watermark, in partitioned mode against the
+// partition's own previous value. A watermark for an idle partition is a
+// resume and must additionally reach the current effective watermark;
+// equality on either bound resumes. Only an accepted watermark updates the
+// reporting bookkeeping and triggers the shared advance-and-close path.
+func (s *aggregateState) acceptWatermark(wm watermarkRecord, lineNo int) error {
+	next := wm.time
 	if s.partitions == 0 {
 		if s.watermark != nil && next < *s.watermark {
 			return &InputError{Line: lineNo, Reason: fmt.Sprintf("watermark moved backwards from %d to %d", *s.watermark, next)}
 		}
 		s.watermark = &next
 	} else {
+		p := wm.partition
 		resuming := s.idle[p]
 		if resuming {
 			// A resume watermark must be at least the partition's previous
@@ -849,10 +901,11 @@ func (s *aggregateState) effectiveWatermark() *int64 {
 	return &min
 }
 
-// requiredPartition returns the record's partition index. In legacy mode it
-// returns 0 without inspecting the record, so extra fields stay ignored. In
-// partitioned mode the actual reading and range checking lives in the shared
-// free function used by event interpretation as well.
+// requiredPartition returns an idle declaration's partition index. In legacy
+// mode it returns 0 without inspecting the record, so extra fields stay
+// ignored. In partitioned mode the actual reading and range checking lives
+// in the shared free function used by event and watermark interpretation as
+// well.
 func (s *aggregateState) requiredPartition(obj map[string]json.RawMessage, lineNo int) (int64, error) {
 	if s.partitions == 0 {
 		return 0, nil
