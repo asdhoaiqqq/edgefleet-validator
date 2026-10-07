@@ -83,6 +83,9 @@ const (
 	AggregateParamSlide AggregateParamName = "slide"
 	// AggregateParamPartitions is the partition count (--partitions).
 	AggregateParamPartitions AggregateParamName = "partitions"
+	// AggregateParamMaxOpenWindows is the still-open window cap
+	// (--max-open-windows).
+	AggregateParamMaxOpenWindows AggregateParamName = "max-open-windows"
 )
 
 // AggregateParamKind classifies the problem ValidateAggregateParams found with
@@ -129,6 +132,8 @@ func (e *AggregateParamError) Error() string {
 			return fmt.Sprintf("slide interval must be a positive signed 64-bit integer, got %d", e.Value)
 		case AggregateParamPartitions:
 			return fmt.Sprintf("partition count must be a positive signed 64-bit integer, got %d", e.Value)
+		case AggregateParamMaxOpenWindows:
+			return fmt.Sprintf("max open windows must be a positive signed 64-bit integer, got %d", e.Value)
 		}
 	}
 	return fmt.Sprintf("invalid aggregate parameter %s: %d", e.Field, e.Value)
@@ -159,6 +164,22 @@ func ValidateAggregateParams(windowMillis, slideMillis, partitions int64) error 
 	}
 	if partitions < 0 {
 		return &AggregateParamError{Field: AggregateParamPartitions, Kind: AggregateParamNotPositive, Value: partitions}
+	}
+	return nil
+}
+
+// ValidateMaxOpenWindows enforces the limit on the optional still-open window
+// cap shared by the entry points that accept one. The cap is opt-in: callers
+// pass 0 when the parameter was omitted, and this returns nil so that zero
+// keeps the unlimited behavior exactly as before; an entry like the command
+// line that can tell "flag absent" from "flag given zero" applies its own
+// explicit-zero rejection around this call. A negative value is rejected as
+// *AggregateParamError on AggregateParamMaxOpenWindows before any input is
+// read. Positive values up to math.MaxInt64 are all sound: they are compared
+// against a map size, so they never have to divide another parameter.
+func ValidateMaxOpenWindows(maxOpenWindows int64) error {
+	if maxOpenWindows < 0 {
+		return &AggregateParamError{Field: AggregateParamMaxOpenWindows, Kind: AggregateParamNotPositive, Value: maxOpenWindows}
 	}
 	return nil
 }
@@ -303,21 +324,140 @@ func RunAggregatePartitioned(r io.Reader, windowMillis, partitions int64, out io
 // overflow checks and end-of-input behavior are otherwise identical to
 // RunAggregateSliding.
 func RunAggregatePartitionedSliding(r io.Reader, windowMillis, slideMillis, partitions int64, out io.Writer, lateLog io.Writer) error {
-	if err := ValidateAggregateParams(windowMillis, slideMillis, partitions); err != nil {
+	return runAggregateWithConfig(r, aggregateConfig{
+		windowMillis: windowMillis,
+		slideMillis:  slideMillis,
+		partitions:   partitions,
+		out:          out,
+		lateLog:      lateLog,
+	})
+}
+
+// RunAggregateWithMaxOpenWindows is RunAggregate with an optional cap on how
+// many aggregate records may stay open at once. maxOpenWindows == 0 keeps the
+// unlimited behavior of RunAggregate exactly: with a watermark that never
+// advances and endlessly growing keys the open state grows without bound. A
+// positive value bounds it: each distinct decoded key paired with one window
+// interval [start,end) occupies one slot for as long as that window is open,
+// independently of how many events it counted and of which partition (if any)
+// contributed. Repeated events for a key and window that already exist only
+// add to that window's count and sum and take no new slot, so a full cap
+// never rejects them. Under sliding windows one event can land in several
+// overlapping windows: a (key, window) pair the event opens for the first
+// time takes one slot each, while pairs that already exist take none; the
+// whole event is accepted when its new slots land exactly on the cap and
+// rejected as one unit when they would exceed it -- no window is created,
+// count or sum changed or slot consumed by a rejected event. Slots are
+// released only after a window closes under the existing watermark rules and
+// its result has been written in full; a partition merely going idle frees
+// nothing unless that declaration advances the effective watermark and closes
+// windows. Field errors, idle-partition record errors and late skips keep
+// their existing precedence: a late event is skipped as before, takes no
+// slot and can never be re-reported as an overflow of the cap. A rejection is
+// an *InputError at the event's own physical input line, naming the line, the
+// event key, the slots currently occupied, the new slots the event would
+// need and the configured cap; processing then stops with later records
+// unread while results already written stay in place. maxOpenWindows < 0 is
+// rejected before input is read.
+func RunAggregateWithMaxOpenWindows(r io.Reader, windowMillis, maxOpenWindows int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateWithConfig(r, aggregateConfig{
+		windowMillis:   windowMillis,
+		slideMillis:    windowMillis,
+		maxOpenWindows: maxOpenWindows,
+		out:            out,
+		lateLog:        lateLog,
+	})
+}
+
+// RunAggregateSlidingWithMaxOpenWindows is RunAggregateWithMaxOpenWindows
+// with overlapping windows, exactly as RunAggregateSliding relates to
+// RunAggregate: slideMillis is the positive distance between consecutive
+// window starts and must not exceed windowMillis. Every other cap rule
+// (per-(key,window) slots, atomic admission of all of an event's new
+// overlapping windows, release only after a fully written closure and the
+// rejection *InputError) is identical.
+func RunAggregateSlidingWithMaxOpenWindows(r io.Reader, windowMillis, slideMillis, maxOpenWindows int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateWithConfig(r, aggregateConfig{
+		windowMillis:   windowMillis,
+		slideMillis:    slideMillis,
+		maxOpenWindows: maxOpenWindows,
+		out:            out,
+		lateLog:        lateLog,
+	})
+}
+
+// RunAggregatePartitionedWithMaxOpenWindows combines
+// RunAggregateWithMaxOpenWindows with partitioned inputs: events from
+// different partitions merge into one count and sum per key and window, so
+// the same key landing in the same window from another partition occupies no
+// additional slot. The effective (minimum) watermark alone drives late-event
+// checks and closure; an idle declaration releases slots only when it
+// advances that watermark far enough to close windows. partitions selects
+// the mode exactly as in RunAggregatePartitionedSliding.
+func RunAggregatePartitionedWithMaxOpenWindows(r io.Reader, windowMillis, partitions, maxOpenWindows int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateWithConfig(r, aggregateConfig{
+		windowMillis:   windowMillis,
+		slideMillis:    windowMillis,
+		partitions:     partitions,
+		maxOpenWindows: maxOpenWindows,
+		out:            out,
+		lateLog:        lateLog,
+	})
+}
+
+// RunAggregatePartitionedSlidingWithMaxOpenWindows is the full combination:
+// sliding windows, partitioned inputs and the still-open window cap. The
+// window, slide and partition rules are exactly those of
+// RunAggregatePartitionedSliding and the cap rules are exactly those of
+// RunAggregateWithMaxOpenWindows.
+func RunAggregatePartitionedSlidingWithMaxOpenWindows(r io.Reader, windowMillis, slideMillis, partitions, maxOpenWindows int64, out io.Writer, lateLog io.Writer) error {
+	return runAggregateWithConfig(r, aggregateConfig{
+		windowMillis:   windowMillis,
+		slideMillis:    slideMillis,
+		partitions:     partitions,
+		maxOpenWindows: maxOpenWindows,
+		out:            out,
+		lateLog:        lateLog,
+	})
+}
+
+// aggregateConfig is the one internal description every public aggregate
+// entry point reduces to: the window parameters, the optional partition
+// count, the optional still-open window cap (0 = unlimited) and the two
+// output writers. Keeping a single struct means the four uncapped entry
+// points and the four capped ones run one identical implementation.
+type aggregateConfig struct {
+	windowMillis   int64
+	slideMillis    int64
+	partitions     int64
+	maxOpenWindows int64 // 0 keeps the unlimited behavior; negative is rejected up front
+	out            io.Writer
+	lateLog        io.Writer
+}
+
+// runAggregate is the shared body behind every public aggregate entry point.
+// It validates all startup parameters before the reader is touched, then runs
+// the line collector over one aggregateState built from cfg.
+func runAggregateWithConfig(r io.Reader, cfg aggregateConfig) error {
+	if err := ValidateAggregateParams(cfg.windowMillis, cfg.slideMillis, cfg.partitions); err != nil {
+		return err
+	}
+	if err := ValidateMaxOpenWindows(cfg.maxOpenWindows); err != nil {
 		return err
 	}
 	s := &aggregateState{
-		windowMillis:  windowMillis,
-		slideMillis:   slideMillis,
-		windows:       make(map[windowID]*windowState),
-		out:           out,
-		lateLog:       lateLog,
-		partitions:    partitions,
-		partWatermark: make(map[int64]*int64),
-		idle:          make(map[int64]bool),
+		windowMillis:   cfg.windowMillis,
+		slideMillis:    cfg.slideMillis,
+		windows:        make(map[windowID]*windowState),
+		out:            cfg.out,
+		lateLog:        cfg.lateLog,
+		partitions:     cfg.partitions,
+		maxOpenWindows: cfg.maxOpenWindows,
+		partWatermark:  make(map[int64]*int64),
+		idle:           make(map[int64]bool),
 		// Every partition starts out active and unreported; in legacy mode
 		// (partitions == 0) the counter stays zero and is never consulted.
-		unreportedActive: partitions,
+		unreportedActive: cfg.partitions,
 	}
 
 	// Read records with a line collector that keeps a read failure distinct
@@ -491,6 +631,15 @@ type aggregateState struct {
 	// being declared idle, and resuming from idle always happens through a
 	// watermark record, which reports at the same moment.
 	unreportedActive int64
+
+	// maxOpenWindows optionally caps the number of still-open aggregate
+	// records. Zero means unlimited, which is the behavior without the option;
+	// runAggregateWithConfig rejects a negative value before reading input. Each
+	// windows-map entry is one (key, window interval) pair and therefore one
+	// occupied slot; events folding into an existing pair take none, and a
+	// window releases its slot only when it has closed and its result line
+	// has been written in full.
+	maxOpenWindows int64
 }
 
 func (s *aggregateState) processLine(line string, lineNo int) error {
@@ -775,6 +924,17 @@ func (s *aggregateState) acceptEvent(ev eventRecord, lineNo int) error {
 // same set of windows. The precheck runs before any window is touched;
 // per-window count and sum overflows then fail on this triggering event in
 // ascending window-start order rather than at watermark closure.
+//
+// When a still-open window cap is configured, admission is decided for the
+// whole event before the counting loop touches anything: the event counts how
+// many of its containing (key, window) pairs do not exist yet -- windows the
+// event folds into that are already open take no new slot, which is why
+// partitions merging into the same pair and repeated events for the same pair
+// never count again -- and is accepted only when the present occupancy plus
+// those new slots is at most the cap. Landing exactly on the cap is accepted;
+// exceeding it rejects the whole physical line with no window created and no
+// count or sum changed, so an event can never occupy part of its overlapping
+// windows.
 func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
 	wins := s.containingWindows(ev.time)
 
@@ -782,6 +942,29 @@ func (s *aggregateState) applyEventToWindows(ev eventRecord, lineNo int) error {
 	// whole input line; check before updating any window state.
 	if wins.firstOverflow >= 0 {
 		return &InputError{Line: lineNo, Reason: fmt.Sprintf("window end overflow for key %q window starting at %d with length %d", ev.key, wins.firstOverflow, s.windowMillis)}
+	}
+
+	if s.maxOpenWindows > 0 {
+		// One map entry is one open (key, window interval) pair and therefore
+		// one occupied slot; only pairs this event opens for the first time
+		// add to the count. The check is a pure read, so on rejection no
+		// window state -- including pairs that already existed -- changes.
+		// Admission is the invariant len(s.windows) <= maxOpenWindows, so
+		// maxOpenWindows-occupied never goes negative and the subtraction
+		// form cannot overflow the way occupied+needed could.
+		occupied := int64(len(s.windows))
+		var needed int64
+		for i := wins.count - 1; i >= 0; i-- {
+			id := windowID{start: wins.start(i), key: ev.key}
+			if _, ok := s.windows[id]; !ok {
+				needed++
+			}
+		}
+		if needed > s.maxOpenWindows-occupied {
+			return &InputError{Line: lineNo, Reason: fmt.Sprintf(
+				"open-window limit exceeded for key %q: %d window(s) currently open, event needs %d new window(s), limit %d",
+				ev.key, occupied, needed, s.maxOpenWindows)}
+		}
 	}
 
 	// Add the event once to each containing window, in ascending start

@@ -32,7 +32,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>]|help]")
+	fmt.Println("usage: edgefleet [demo|version|aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>] [--max-open-windows <count>]|help]")
 	fmt.Println()
 	fmt.Println("commands:")
 	fmt.Println("  demo       run a built-in fleet health demonstration")
@@ -41,7 +41,7 @@ func usage() {
 	fmt.Println("  help       show this help")
 	fmt.Println()
 	fmt.Println("aggregate:")
-	fmt.Println("  edgefleet aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>]")
+	fmt.Println("  edgefleet aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>] [--max-open-windows <count>]")
 	fmt.Println()
 	fmt.Println("  --window-ms is a required positive signed 64-bit integer. Aggregation runs")
 	fmt.Println("  fully offline and never uses the current time; all timing comes from input.")
@@ -71,6 +71,31 @@ func usage() {
 	fmt.Println("  [1200,2200), ... and an event at time 1000 is outside the first. When")
 	fmt.Println("  --slide-ms is omitted or equals --window-ms the behavior is identical")
 	fmt.Println("  to fixed windows.")
+	fmt.Println()
+	fmt.Println("  --max-open-windows optionally caps how much aggregate state is kept")
+	fmt.Println("  while the watermark stalls and the keys keep changing. <count> must be")
+	fmt.Println("  a positive signed 64-bit integer; omitting the flag keeps the")
+	fmt.Println("  unlimited behavior. One slot is held per distinct")
+	fmt.Println("  pair of a decoded event key and one window interval [start,end) that")
+	fmt.Println("  has not closed yet: slots are not counted per event record and not per")
+	fmt.Println("  partition, so further events for a key and window that already exist")
+	fmt.Println("  only grow that window's count and sum and take no new slot even when")
+	fmt.Println("  the cap is full, and contributions to the same key and window from")
+	fmt.Println("  different partitions merge into the one slot. With sliding windows a")
+	fmt.Println("  single event can enter several overlapping windows: each (key,")
+	fmt.Println("  window) pair it opens for the first time takes one slot, while pairs")
+	fmt.Println("  that already exist take none. When a legal, non-late event's new")
+	fmt.Println("  windows land exactly on the cap it is accepted; if they would exceed")
+	fmt.Println("  it, the whole physical input line fails with exit code 1, the line")
+	fmt.Println("  number, the event key, the slots currently open, the new slots the")
+	fmt.Println("  event needs and the configured cap; the event enters none of its")
+	fmt.Println("  windows, no later record is read, and results already written are")
+	fmt.Println("  retained. Slots are released only when a window closes under the")
+	fmt.Println("  watermark rules and its result line has been written in full, so a")
+	fmt.Println("  later event can reuse them; declaring a partition idle frees nothing")
+	fmt.Println("  by itself and only frees slots when it advances the effective")
+	fmt.Println("  watermark enough to close windows. Late events take no slot and are")
+	fmt.Println("  still skipped as late, never reported as the cap being exceeded.")
 	fmt.Println()
 	fmt.Println("  a watermark declares that events with time below it are late. Before the")
 	fmt.Println("  first watermark every valid event is accepted. After a watermark, every")
@@ -121,9 +146,11 @@ func usage() {
 	fmt.Println("  watermark mode an idle record is an unknown record type.")
 	fmt.Println()
 	fmt.Println("  invalid command parameters -- a missing --window-ms, or a")
-	fmt.Println("  non-positive --window-ms or --slide-ms, or a --slide-ms larger than")
-	fmt.Println("  --window-ms, or a non-positive --partitions -- print the reason to")
-	fmt.Println("  standard error and exit non-zero before any input is read. Malformed")
+	fmt.Println("  non-positive --window-ms, --slide-ms or --max-open-windows, or a")
+	fmt.Println("  --slide-ms larger than --window-ms, or a non-positive --partitions,")
+	fmt.Println("  or a --max-open-windows that is not an integer or is outside the")
+	fmt.Println("  signed 64-bit range -- print the reason to standard error and exit")
+	fmt.Println("  with code 2 before any input is read. Malformed")
 	fmt.Println("  JSON, missing or mistyped fields, out-of-range integers, unknown")
 	fmt.Println("  record types, missing or out-of-range partitions, partition watermark")
 	fmt.Println("  regression, an event for an idle partition, a resume watermark below")
@@ -133,9 +160,13 @@ func usage() {
 	fmt.Println("  names the top-level key field more than once (the field is judged by")
 	fmt.Println("  its decoded name, so an equivalent escape spelling still repeats it,")
 	fmt.Println("  and equal values still count; this is rejected before the event's")
-	fmt.Println("  fields, partition state and lateness), and window-end,")
-	fmt.Println("  event-count or cumulative-sum overflow print the input line number and")
-	fmt.Println("  reason to standard error and stop processing with a non-zero exit; no")
+	fmt.Println("  fields, partition state and lateness), window-end,")
+	fmt.Println("  event-count or cumulative-sum overflow, and a legal event that would")
+	fmt.Println("  open more still-open key/window pairs than --max-open-windows allows")
+	fmt.Println("  (the error names the line, the key, the current open count, the new")
+	fmt.Println("  windows needed and the configured cap, and the whole event enters no")
+	fmt.Println("  window) print the input line number and")
+	fmt.Println("  reason to standard error and stop processing with exit code 1; no")
 	fmt.Println("  further records are read and earlier output is retained. A window")
 	fmt.Println("  result or late-event notice that cannot be written in full (the")
 	fmt.Println("  output writer errors, even after accepting a prefix, or accepts too")
@@ -156,12 +187,13 @@ func runAggregate(args []string) int {
 	fs := flag.NewFlagSet("aggregate", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>]")
+		fmt.Fprintln(fs.Output(), "usage: edgefleet aggregate --window-ms <milliseconds> [--slide-ms <milliseconds>] [--partitions <count>] [--max-open-windows <count>]")
 		fmt.Fprintln(fs.Output(), `run "edgefleet help" for the full record and window closure rules`)
 	}
 	windowMillis := fs.Int64("window-ms", 0, "window length in milliseconds (required, positive signed 64-bit integer)")
 	slideMillis := fs.Int64("slide-ms", 0, "distance between consecutive window starts in milliseconds (optional positive signed 64-bit integer, no greater than --window-ms); defaults to the window length for non-overlapping fixed windows")
 	partitions := fs.Int64("partitions", 0, "number of input partitions (optional positive signed 64-bit integer); when set, every record must carry an integer partition in [0,count)")
+	maxOpenWindows := fs.Int64("max-open-windows", 0, "maximum number of still-open key/window pairs kept at once (optional positive signed 64-bit integer); omitting the flag leaves the number unlimited")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -173,6 +205,7 @@ func runAggregate(args []string) int {
 	windowSpecified := false
 	slideSpecified := false
 	partitionsSpecified := false
+	maxOpenWindowsSpecified := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "window-ms":
@@ -181,6 +214,8 @@ func runAggregate(args []string) int {
 			slideSpecified = true
 		case "partitions":
 			partitionsSpecified = true
+		case "max-open-windows":
+			maxOpenWindowsSpecified = true
 		}
 	})
 	if !windowSpecified {
@@ -216,11 +251,21 @@ func runAggregate(args []string) int {
 		fmt.Fprintf(os.Stderr, "aggregate --partitions must be a positive signed 64-bit integer, got %d\n", *partitions)
 		return 2
 	}
+	// Omitted --max-open-windows keeps the unlimited behavior (the runner
+	// reads zero as "no cap"). The command rejects an explicitly supplied
+	// non-positive value; non-integer and out-of-range spellings never reach
+	// here, the flag parser rejects them with exit 2 while parsing.
+	if maxOpenWindowsSpecified && *maxOpenWindows <= 0 {
+		fmt.Fprintf(os.Stderr, "aggregate --max-open-windows must be a positive signed 64-bit integer, got %d\n", *maxOpenWindows)
+		return 2
+	}
 	var err error
+	// A zero cap means unlimited, so the capped entry points reproduce the
+	// uncapped ones exactly when the flag is omitted.
 	if partitionsSpecified {
-		err = edgefleet.RunAggregatePartitionedSliding(os.Stdin, *windowMillis, *slideMillis, *partitions, os.Stdout, os.Stderr)
+		err = edgefleet.RunAggregatePartitionedSlidingWithMaxOpenWindows(os.Stdin, *windowMillis, *slideMillis, *partitions, *maxOpenWindows, os.Stdout, os.Stderr)
 	} else {
-		err = edgefleet.RunAggregateSliding(os.Stdin, *windowMillis, *slideMillis, os.Stdout, os.Stderr)
+		err = edgefleet.RunAggregateSlidingWithMaxOpenWindows(os.Stdin, *windowMillis, *slideMillis, *maxOpenWindows, os.Stdout, os.Stderr)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "aggregate:", err)
