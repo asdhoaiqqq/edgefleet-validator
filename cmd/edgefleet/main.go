@@ -75,6 +75,26 @@ func parseTimeFlag(value, flagName string) time.Time {
 	return t
 }
 
+// parseQueryTimeFlag parses the health query's --at instant, defaulting to
+// now when empty. An explicit query time is held to the same timezone-offset
+// and fractional-second limits as a heartbeat's collected_at (see
+// edgefleet.ParseHealthQueryTime): plain time.Parse would fold an
+// out-of-range offset (+00:60 -> +01:00) and truncate a fraction past nine
+// digits, silently judging the node at a moment the user never wrote — which
+// can flip a just-expired query to exactly-on-time. The check runs before
+// any store access, so it applies even when the node has no telemetry or a
+// missed-duty baseline is given.
+func parseQueryTimeFlag(value string) time.Time {
+	if value == "" {
+		return time.Now()
+	}
+	t, err := edgefleet.ParseHealthQueryTime(value)
+	if err != nil {
+		die("invalid --at %q: %v", value, err)
+	}
+	return t
+}
+
 func runHeartbeat(args []string) {
 	if len(args) == 0 {
 		heartbeatUsage()
@@ -134,7 +154,13 @@ func heartbeatUsage() {
 	fmt.Println("           --tolerated-misses N  tolerated missed duties, >= 0 (required)")
 	fmt.Println("           --missed-since-seq S  seq of a saved heartbeat used as the")
 	fmt.Println("                                missed-duty baseline (optional, > 0)")
-	fmt.Println("           --at TIME             query time, RFC3339 (default: now)")
+	fmt.Println("           --at TIME             query time, RFC3339 with timezone (default:")
+	fmt.Println("                                now); an explicit value is held to the same")
+	fmt.Println("                                offset and fractional-second limits as")
+	fmt.Println("                                collected_at: offset hour 00-23, minute")
+	fmt.Println("                                00-59 (no folding, no ±24:00); a fraction")
+	fmt.Println("                                past nine digits is accepted only when all")
+	fmt.Println("                                further digits are zero")
 	fmt.Println("           --data-dir DIR        data directory")
 	fmt.Println()
 	fmt.Println("  Without --missed-since-seq the missed-duty alarm uses the cumulative")
@@ -236,7 +262,7 @@ func cmdHealth(args []string) {
 		die("--missed-since-seq must be a positive integer")
 	}
 
-	at := parseTimeFlag(*atStr, "--at")
+	at := parseQueryTimeFlag(*atStr)
 
 	store, err := edgefleet.OpenStore(*dataDir)
 	if err != nil {

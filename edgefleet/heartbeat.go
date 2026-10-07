@@ -266,6 +266,32 @@ func validateCollectedAtFraction(s string) error {
 	return nil
 }
 
+// ParseHealthQueryTime parses an explicitly given health-query instant (the
+// CLI's --at) under exactly the text rules a collected_at timestamp is held
+// to, because the query instant is compared against saved collection times
+// and must be the precise moment the user wrote: RFC3339 with an explicit
+// timezone; a numeric offset whose hour is 00-23 and minute 00-59 with no
+// carry-over (±24:00 and a folded offset such as +00:60 are refused, while
+// "Z", "-00:00" and ±23:59 stay legal); and a fractional second — written
+// with "." or "," — that is exact at nanosecond precision (more than nine
+// digits only when every digit past the ninth is zero, never truncated or
+// rounded). time.Parse alone folds out-of-range offsets and truncates long
+// fractions, which would let a moment the user never wrote judge a node
+// online or offline, so both text-level guards run after it.
+func ParseHealthQueryTime(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00+08:00): %w", err)
+	}
+	if err := validateCollectedAtText(s); err != nil {
+		return time.Time{}, err
+	}
+	if err := validateCollectedAtFraction(s); err != nil {
+		return time.Time{}, err
+	}
+	return t, nil
+}
+
 // checkHeartbeatValues runs every context-free field-value rule in the single
 // rejection order shared by the direct-submit and stored-data boundaries:
 // node, seq, version, height, missed, then collected_at. It deliberately does
