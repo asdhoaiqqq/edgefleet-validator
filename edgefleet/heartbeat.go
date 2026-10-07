@@ -19,10 +19,11 @@ import (
 //	                      (required; year 0000-9999, numeric offset hour 00-23
 //	                      and minute 00-59 on the minute — +24:00 and a folded
 //	                      offset such as +00:60 are rejected, not normalised;
-//	                      a fractional second must be exactly representable at
-//	                      nanosecond precision — more than nine digits is
-//	                      accepted only when every digit past the ninth is
-//	                      zero, never truncated or rounded)
+//	                      a fractional second, written with either "." or ","
+//	                      as its decimal separator, must be exactly
+//	                      representable at nanosecond precision — more than
+//	                      nine digits is accepted only when every digit past
+//	                      the ninth is zero, never truncated or rounded)
 //	version       string   version (required, non-empty, valid Unicode text)
 //	height        integer  block height (required, >= 0)
 //	missed        integer  cumulative missed duties (required, >= 0)
@@ -230,32 +231,36 @@ func twoDecimalDigits(s string) (int, bool) {
 
 // validateCollectedAtFraction guards the second gap in time.Parse(RFC3339)
 // that the instant-level check cannot see: the standard library silently
-// truncates a fractional second beyond nine digits, so ".1234567891" and
-// ".1234567892" both decode to the same nanosecond instant even though the
-// node reported two different moments. Heartbeat collection times must be
-// preserved exactly, so such input is refused, never truncated or rounded.
-// A fraction of at most nine digits always parses exactly, and a longer
-// fraction is accepted only when every digit past the ninth is zero — the
-// text then denotes the same instant as its nine-digit prefix (".1234567890"
-// is ".123456789"). The string has already passed time.Parse, so a "."
-// can only introduce the fractional second and what follows it up to the
-// zone suffix is all digits.
+// truncates a fractional second beyond nine digits — with either of the
+// decimal separators it accepts, "." and "," — so ".1234567891" and
+// ".1234567892", and likewise ",1234567891" and ",1234567892", both decode
+// to the same nanosecond instant even though the node reported two different
+// moments. Heartbeat collection times must be preserved exactly, so such
+// input is refused under the same rule no matter which separator was written,
+// never truncated or rounded. A fraction of at most nine digits always parses
+// exactly, and a longer fraction is accepted only when every digit past the
+// ninth is zero — the text then denotes the same instant as its nine-digit
+// prefix (".1234567890" and ",123456789000" are both ".123456789"). The
+// string has already passed time.Parse, so the "." or "," found here can only
+// introduce the fractional second and what follows it up to the zone suffix
+// is all digits.
 func validateCollectedAtFraction(s string) error {
-	dot := strings.IndexByte(s, '.')
-	if dot < 0 {
+	sep := strings.IndexAny(s, ".,")
+	if sep < 0 {
 		return nil
 	}
-	end := dot + 1
+	end := sep + 1
 	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
 		end++
 	}
-	frac := s[dot+1 : end]
-	if len(frac) <= 9 {
+	frac := s[sep:end] // separator plus digits, quoted verbatim in errors
+	digits := frac[1:]
+	if len(digits) <= 9 {
 		return nil
 	}
-	for i := 9; i < len(frac); i++ {
-		if frac[i] != '0' {
-			return fmt.Errorf("fractional second .%s cannot be represented exactly at nanosecond precision: digit %d is not zero, and digits past the ninth must all be zero (the instant is never truncated or rounded)", frac, i+1)
+	for i := 9; i < len(digits); i++ {
+		if digits[i] != '0' {
+			return fmt.Errorf("fractional second %s cannot be represented exactly at nanosecond precision: digit %d is not zero, and digits past the ninth must all be zero (the instant is never truncated or rounded)", frac, i+1)
 		}
 	}
 	return nil
@@ -577,7 +582,8 @@ func decodeStrictHeartbeatObject(raw json.RawMessage) (Heartbeat, error) {
 		return Heartbeat{}, fmt.Errorf("collected_at must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00+08:00): %w", err)
 	}
 	// time.Parse also silently truncates a fractional second beyond nine
-	// digits; the collection moment must be exactly representable.
+	// digits for both accepted separators ("." and ","); the collection
+	// moment must be exactly representable.
 	if err := validateCollectedAtFraction(collectedStr); err != nil {
 		return Heartbeat{}, fmt.Errorf("collected_at must be RFC3339 with timezone (e.g. 2026-10-01T12:00:00+08:00): %w", err)
 	}
